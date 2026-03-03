@@ -42,6 +42,7 @@ const defaultSettings = {
     
     panelCollapsed: {
         api: false,
+        msgopt: false,
         presets: false,
         generate: false,
         export: false,
@@ -50,18 +51,33 @@ const defaultSettings = {
     },
 
     // API 设置
-    apiUrl: '',
-    apiKey: '',
+    apiEndpoints: [
+        { id: 'default', name: '默认 API', url: '', key: '', temp: 0.7, topP: 1.0, topK: 0, maxTokens: 4096, extraParams: '' }
+    ],
+    selectedApiEndpointId: 'default',
     apiModel: '',
-    apiTemp: 0.7,
-    apiTopP: 1.0,
-    apiTopK: 0,
-    apiMaxTokens: 4096,
-    apiExtraParams: '',
     apiEnabled: false,
+
+    // 消息优化设置
+    enableMsgOptimization: false,
+    msgOptModel: '',
+    msgOptTemp: 0.7,
+    msgOptTopP: 1.0,
+    msgOptTopK: 0,
+    msgOptMaxTokens: 4096,
+    msgOptSystemPrompt: "请根据以下预设条目和最新的AI回复，对AI回复进行润色优化。要求：1. 保持人物性格一致 2. 润色文笔 3. 修复逻辑漏洞 4. 仅输出最终正文，不输出其他多余内容。",
+    msgOptPresets: [
+        { id: 'latest_ai', name: "最新AI消息", content: "[LATEST_AI_MESSAGE]", isEnabled: true, isHidden: false, icon: "🤖", priority: 0, role: 'system', isLocked: true },
+        { id: 'msg_opt_1', name: "润色文笔", content: "使语言更加优美生动，符合小说体裁。", isEnabled: true, isHidden: false, icon: "✍️", priority: 1, role: 'system' }
+    ],
 
     // 提示词预设
     enablePresetOptimization: false,
+    presetModel: '',
+    presetTemp: 0.7,
+    presetTopP: 1.0,
+    presetTopK: 0,
+    presetMaxTokens: 4096,
     presetSystemPrompt: "请根据以下预设条目和当前的续写需求，生成一段具体的、发给小说续写AI的指令（Prompt）。要求：1. 只有正文 2. 包含具体的剧情走向建议 3. 保持文风一致性。",
     presets: [
         { id: 'history', name: "酒馆聊天历史", content: "[CHAT_HISTORY]", isEnabled: false, isHidden: false, icon: "📜", priority: 0, role: 'system', isLocked: true },
@@ -77,6 +93,8 @@ const defaultSettings = {
 let settings = {};
 let abortGeneration = false;
 let generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
+let isOptimizing = false;
+let lastOptimizedId = -1;
 
 // ============================================
 // 工具函数
@@ -275,9 +293,9 @@ function showHelp(topic) {
 <p>从 AI 回复的原始内容中，只提取指定 XML 标签内的文字。</p>
 <h4>📌 使用场景</h4>
 <p>当你使用正则美化输出时，原始回复可能包含：</p>
-<pre>&lt;思考&gt;AI的思考过程...&lt;/思考&gt;
-&lt;content&gt;这是正文内容...&lt;/content&gt;</pre>
-<p>使用标签提取可以只导出 &lt;content&gt; 内的正文。</p>
+<pre><思考>AI的思考过程...</思考>
+<content>这是正文内容...</content></pre>
+<p>使用标签提取可以只导出 <content> 内的正文。</p>
 <h4>📌 如何使用</h4>
 <ol>
     <li>✅ 勾选「原始 (chat.mes)」</li>
@@ -293,17 +311,28 @@ function showHelp(topic) {
         api: {
             title: '🌐 自定义 API 说明',
             content: `
-<h4>📌 API URL</h4>
-<p>OpenAI 兼容接口的地址，通常以 <code>/v1</code> 结尾。</p>
-<h4>📌 API Key</h4>
-<p>您的 API 密钥。</p>
+<h4>📌 API 节点配置</h4>
+<p>支持多 API 节点定义。每个节点可以有独立的 URL、Key 和参数。获取的模型列表将按节点合并展示。</p>
 <h4>📌 模型获取</h4>
-<p>点击 🔄 按钮获取可用的模型列表。</p>
+<p>点击 🔄 按钮获取所有节点可用的模型列表。模型将按节点分组显示。</p>
 <h4>📌 参数设置</h4>
 <ul>
     <li><b>温度 (Temp)</b>：控制随机性，越高越放飞。</li>
     <li><b>Top P</b>：核采样阈值。</li>
     <li><b>Top K</b>：采样候选集大小。</li>
+</ul>
+            `
+        },
+        msgopt: {
+            title: '🪄 消息优化说明',
+            content: `
+<h4>📌 什么是消息优化？</h4>
+<p>当酒馆的原生 AI 生成消息完成后，可以自动将该最新回复以及你开启的优化预设发送给“自定义 API”模型进行润色和优化。优化完成后，将自动替换酒馆中的最新消息。</p>
+<h4>📌 如何工作</h4>
+<ul>
+    <li>酒馆 AI 完成生成后触发（包括手动生成和自动生成）。</li>
+    <li>会先对获取的最新回复执行启用了“酒馆消息优化”范围的正则替换。</li>
+    <li>通过自定义 API 生成最终消息，并替换回酒馆。</li>
 </ul>
             `
         },
@@ -332,6 +361,7 @@ function showHelp(topic) {
 <ul>
     <li><b>历史条目中的所有 system 条目</b>：在发送给自定义 API 进行“预设优化”时，对历史聊天记录中的系统(System)消息进行正则替换。</li>
     <li><b>自定义 AI 输出</b>：对自定义 API 返回的所有结果进行正则替换，包括直接生成的续写内容以及预设优化生成的提示词。</li>
+    <li><b>酒馆消息优化</b>：在酒馆AI生成回复后，对回复进行消息优化前执行正则处理。</li>
 </ul>
 <h4>📌 编写规则</h4>
 <p>可以使用 <code>/pattern/flags</code> 的格式（例如 <code>/\\n+/g</code>），如果直接填写文本则默认使用 <code>g</code> 全局替换。替换内容中的 <code>\\n</code> 和 <code>\\t</code> 会被解析为换行符和制表符。</p>
@@ -442,7 +472,9 @@ function showHelp(topic) {
     }, false);
     
     modalContainer.addEventListener('touchstart', (e) => {
-        e.stopPropagation();
+        if (e.target === modalContainer) {
+            e.stopPropagation();
+        }
     }, { passive: true });
     
     // 添加到 body 最后，确保在最顶层
@@ -483,7 +515,7 @@ function refreshPreview() {
         return;
     }
     
-    const rawPreview = rawContent.substring(0, 200).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const rawPreview = rawContent.substring(0, 200).replace(/</g, '<').replace(/>/g, '>');
     let html = `
         <div class="nag-preview-source">楼层 ${floor} | 长度 ${rawContent.length} 字</div>
         <div class="nag-preview-raw">${rawPreview}${rawContent.length > 200 ? '...' : ''}</div>
@@ -611,6 +643,7 @@ function applyRegexes(text, scope) {
         let applies = false;
         if (scope === 'system' && r.scopeSystem) applies = true;
         if (scope === 'ai' && r.scopeCustomAI) applies = true;
+        if (scope === 'msgOpt' && r.scopeMsgOpt) applies = true;
         
         if (applies && r.regex) {
             try {
@@ -646,7 +679,8 @@ function renderRegexItems() {
     settings.regexItems.forEach((r) => {
         let scopeBadges = '';
         if (r.scopeSystem) scopeBadges += '<span class="nag-preset-role-badge role-system" style="margin-right:2px;">System</span>';
-        if (r.scopeCustomAI) scopeBadges += '<span class="nag-preset-role-badge role-assistant">AI输出</span>';
+        if (r.scopeCustomAI) scopeBadges += '<span class="nag-preset-role-badge role-assistant" style="margin-right:2px;">AI输出</span>';
+        if (r.scopeMsgOpt) scopeBadges += '<span class="nag-preset-role-badge role-user">消息优化</span>';
 
         const html = `
             <div class="nag-preset-item" data-id="${r.id}">
@@ -737,6 +771,7 @@ function showRegexModal(id = null) {
         replacement: '',
         scopeSystem: true,
         scopeCustomAI: true,
+        scopeMsgOpt: true,
         isEnabled: true,
         priority: (settings.regexItems?.length || 0) + 1
     };
@@ -757,11 +792,11 @@ function showRegexModal(id = null) {
                     </div>
                     <div class="nag-setting-item">
                         <label>正则内容</label>
-                        <textarea id="modal-regex-content" rows="3" placeholder="例如：\\n{3,}"></textarea>
+                        <textarea id="modal-regex-content" rows="3" placeholder="例如：\\\\n{3,}"></textarea>
                     </div>
                     <div class="nag-setting-item">
                         <label>替换成</label>
-                        <textarea id="modal-regex-replacement" rows="3" placeholder="例如：\\n\\n"></textarea>
+                        <textarea id="modal-regex-replacement" rows="3" placeholder="例如：\\\\n\\\\n"></textarea>
                     </div>
                     <div class="nag-setting-item">
                         <label>作用范围</label>
@@ -773,6 +808,10 @@ function showRegexModal(id = null) {
                             <label class="nag-checkbox-label">
                                 <input type="checkbox" id="modal-regex-scope-ai" ${rItem.scopeCustomAI ? 'checked' : ''}>
                                 <span>自定义 AI 输出</span>
+                            </label>
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="modal-regex-scope-msgopt" ${rItem.scopeMsgOpt ? 'checked' : ''}>
+                                <span>酒馆消息优化</span>
                             </label>
                         </div>
                     </div>
@@ -797,13 +836,14 @@ function showRegexModal(id = null) {
         const replacement = $('#modal-regex-replacement').val();
         const scopeSystem = $('#modal-regex-scope-system').prop('checked');
         const scopeCustomAI = $('#modal-regex-scope-ai').prop('checked');
+        const scopeMsgOpt = $('#modal-regex-scope-msgopt').prop('checked');
 
         if (!name || !regex) {
             toastr.warning('名称和正则内容不能为空');
             return;
         }
 
-        if (!scopeSystem && !scopeCustomAI) {
+        if (!scopeSystem && !scopeCustomAI && !scopeMsgOpt) {
             toastr.warning('至少选择一个作用范围');
             return;
         }
@@ -828,7 +868,8 @@ function showRegexModal(id = null) {
             regex,
             replacement,
             scopeSystem,
-            scopeCustomAI
+            scopeCustomAI,
+            scopeMsgOpt
         };
 
         if (!settings.regexItems) settings.regexItems = [];
@@ -852,123 +893,144 @@ function showRegexModal(id = null) {
 // ============================================
 
 async function fetchApiModels() {
-    const url = settings.apiUrl;
-    const key = settings.apiKey;
+    log('正在获取所有API的模型列表...', 'info');
+    const selectors = [
+        { id: '#nag-set-api-model', current: settings.apiModel },
+        { id: '#nag-set-msgopt-model', current: settings.msgOptModel },
+        { id: '#nag-set-preset-model', current: settings.presetModel }
+    ];
+    
+    selectors.forEach(s => {
+        const $el = $(s.id);
+        $el.empty().append('<option value="">-- 请选择模型 --</option>');
+    });
+    
+    let totalModels = 0;
+    const allModelsByEndpoint = [];
 
-    if (!url) {
-        toastr.error('请先设置 API URL');
-        return;
-    }
+    for (const api of settings.apiEndpoints) {
+        if (!api.url) continue;
+        try {
+            const response = await fetch(`${api.url.replace(/\/+$/, '')}/models`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${api.key}`,
+                    'Content-Type': 'application/json'
+                }
+            });
 
-    try {
-        log('正在获取模型列表...', 'info');
-        const response = await fetch(`${url.replace(/\/+$/, '')}/models`, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${key}`,
-                'Content-Type': 'application/json'
+            if (response.ok) {
+                const data = await response.json();
+                const models = data.data || [];
+                if (models.length > 0) {
+                    allModelsByEndpoint.push({ api, models });
+                    totalModels += models.length;
+                }
             }
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        } catch(e) {
+            log(`获取 [${api.name}] 模型失败: ${e.message}`, 'warning');
         }
-
-        const data = await response.json();
-        const models = data.data || [];
-        
-        const $select = $('#nag-set-api-model');
-        const currentModel = settings.apiModel;
-        
-        $select.empty();
-        $select.append('<option value="">-- 请选择模型 --</option>');
-        
-        models.forEach(m => {
-            const id = m.id || m;
-            $select.append(`<option value="${id}" ${id === currentModel ? 'selected' : ''}>${id}</option>`);
+    }
+    
+    if (totalModels > 0) {
+        selectors.forEach(s => {
+            const $el = $(s.id);
+            allModelsByEndpoint.forEach(item => {
+                const group = $(`<optgroup label="${escapeHtml(item.api.name || 'API ' + item.api.id)}"></optgroup>`);
+                item.models.forEach(m => {
+                    const id = m.id || m;
+                    const val = `${item.api.id}:::${id}`;
+                    group.append(`<option value="${val}" ${val === s.current ? 'selected' : ''}>${id}</option>`);
+                });
+                $el.append(group);
+            });
         });
-
-        toastr.success(`成功获取 ${models.length} 个模型`);
-        log(`成功获取 ${models.length} 个模型`, 'success');
-    } catch (e) {
-        log(`获取模型列表失败: ${e.message}`, 'error');
-        toastr.error(`获取模型列表失败: ${e.message}`);
+        toastr.success(`成功获取 ${totalModels} 个模型`);
+        log(`成功获取 ${totalModels} 个模型`, 'success');
+    } else {
+        toastr.error('未能获取到任何模型');
     }
 }
 
 async function testApiConnection() {
-    const url = settings.apiUrl;
-    const key = settings.apiKey;
-    const model = settings.apiModel;
-
-    if (!url || !model) {
-        toastr.error('请确保已设置 URL 并选择了模型');
+    const current = settings.apiEndpoints.find(e => e.id == settings.selectedApiEndpointId);
+    if (!current || !current.url) {
+        toastr.error('请先设置当前节点的 API URL');
         return;
     }
-
+    
     try {
-        log('正在测试连接...', 'info');
-        const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
-            method: 'POST',
+        log(`正在测试节点 ${current.name} 连接...`, 'info');
+        const response = await fetch(`${current.url.replace(/\/+$/, '')}/models`, {
+            method: 'GET',
             headers: {
-                'Authorization': `Bearer ${key}`,
+                'Authorization': `Bearer ${current.key}`,
                 'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: model,
-                messages: [{ role: 'user', content: 'hi' }],
-                max_tokens: 10
-            })
+            }
         });
 
         if (response.ok) {
-            toastr.success('连接测试成功！');
-            log('连接测试成功', 'success');
+            toastr.success(`${current.name} 连接测试成功！`);
+            log(`${current.name} 连接测试成功`, 'success');
         } else {
             const err = await response.text();
             throw new Error(`HTTP ${response.status}: ${err}`);
         }
     } catch (e) {
-        log(`连接测试失败: ${e.message}`, 'error');
-        toastr.error(`连接测试失败: ${e.message}`);
+        log(`${current.name} 连接测试失败: ${e.message}`, 'error');
+        toastr.error(`${current.name} 连接测试失败: ${e.message}`);
     }
 }
 
-async function callCustomApi(messages) {
-    const url = settings.apiUrl;
-    const key = settings.apiKey;
-    const model = settings.apiModel;
+async function callCustomApi(messages, options = {}) {
+    // 允许通过 options 覆盖全局模型和参数
+    const targetModel = options.model || settings.apiModel;
+    if (!targetModel) {
+        throw new Error('请先选择自定义 API 模型');
+    }
+    
+    const parts = targetModel.split(':::');
+    if (parts.length < 2) {
+        throw new Error('API模型配置有误，请重新选择模型');
+    }
+    const apiId = parts[0];
+    const modelId = parts.slice(1).join(':::');
+    
+    const apiConfig = settings.apiEndpoints.find(e => e.id == apiId) || settings.apiEndpoints[0];
+    if (!apiConfig) throw new Error('找不到对应的 API 配置');
 
-    if (!url || !model) {
-        throw new Error('请确保已设置 API URL 并选择了模型');
+    const url = apiConfig.url;
+    const key = apiConfig.key;
+
+    if (!url || !modelId) {
+        throw new Error('请确保 API URL 已设置并选择了模型');
     }
 
-    // 处理输入，支持字符串或消息数组
     const finalMessages = Array.isArray(messages) ? messages : [{ role: 'user', content: messages }];
     
-    // 打印发送的消息到 F12
-    console.log('[NovelGen] 发送给 API 的消息数组:', finalMessages);
+    console.log(`[NovelGen] 发送给 API [${apiConfig.name}] 的消息数组:`, finalMessages);
 
     let extraParams = {};
-    if (settings.apiExtraParams) {
+    if (apiConfig.extraParams) {
         try {
-            extraParams = JSON.parse(settings.apiExtraParams);
+            extraParams = JSON.parse(apiConfig.extraParams);
         } catch (e) {
-            log('解析额外参数失败，请检查 JSON 格式: ' + e.message, 'warning');
+            log('解析额外参数失败: ' + e.message, 'warning');
         }
     }
 
     const body = {
-        model: model,
+        model: modelId,
         messages: finalMessages,
-        temperature: settings.apiTemp,
-        top_p: settings.apiTopP,
-        max_tokens: settings.apiMaxTokens,
+        temperature: options.temperature ?? apiConfig.temp,
+        top_p: options.topP ?? apiConfig.topP,
+        max_tokens: options.maxTokens ?? apiConfig.maxTokens,
         ...extraParams
     };
     
-    if (settings.apiTopK > 0) {
-        body.top_k = settings.apiTopK;
+    const topK = options.topK ?? apiConfig.topK;
+    if (topK > 0) {
+        body.top_k = topK;
     }
 
     const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
@@ -1178,16 +1240,121 @@ async function generateSingleChapter(num) {
     // 等待回复完成
     const length = await waitForAIResponse(prevCount);
     
+    // 消息优化逻辑
+    if (settings.enableMsgOptimization) {
+        const stChat = getSTChat();
+        let lastAiIndex = -1;
+        let rawContent = '';
+        if (stChat) {
+            for (let i = stChat.length - 1; i >= 0; i--) {
+                const msg = stChat[i];
+                if (msg && !msg.is_user && !msg.is_human && msg.mes) {
+                    rawContent = msg.mes;
+                    lastAiIndex = i;
+                    break;
+                }
+            }
+        }
+        
+        if (lastAiIndex !== -1 && rawContent) {
+            try {
+                isOptimizing = true;
+                await performMessageOptimization(lastAiIndex, rawContent);
+                lastOptimizedId = lastAiIndex;
+            } finally {
+                isOptimizing = false;
+            }
+        }
+    }
+    
+    const finalLength = settings.enableMsgOptimization ? getLastAIMessageLength() : length;
+
     // 检查长度
-    if (length < settings.minChapterLength) {
-        throw new Error(`响应过短 (${length} 字)`);
+    if (finalLength < settings.minChapterLength) {
+        throw new Error(`响应过短 (${finalLength} 字)`);
     }
     
     generationStats.chaptersGenerated++;
-    generationStats.totalCharacters += length;
-    log(`第 ${num} 章完成 (${length} 字)`, 'success');
+    generationStats.totalCharacters += finalLength;
+    log(`第 ${num} 章完成 (${finalLength} 字)`, 'success');
     
-    return length;
+    return finalLength;
+}
+
+async function performMessageOptimization(lastAiIndex, rawContent) {
+    if (!settings.apiEndpoints || settings.apiEndpoints.length === 0 || !settings.apiEndpoints.some(e => e.url)) {
+        log('未配置自定义API节点，跳过消息优化', 'warning');
+        return;
+    }
+
+    const activePresets = settings.msgOptPresets
+        .filter(p => p.isEnabled && !p.isHidden)
+        .sort((a, b) => a.priority - b.priority);
+
+    if (activePresets.length === 0) {
+        log('没有启用的消息优化预设条目，跳过优化', 'info');
+        return;
+    }
+
+    let optimizedInput = applyRegexes(rawContent, 'msgOpt');
+
+    const messages = [
+        { role: 'system', content: settings.msgOptSystemPrompt }
+    ];
+
+    for (const p of activePresets) {
+        if (p.id === 'latest_ai') {
+            messages.push({ 
+                role: 'system', 
+                content: `[LATEST_AI_MESSAGE]\n${optimizedInput}`
+            });
+        } else {
+            messages.push({ 
+                role: p.role || 'system', 
+                content: `### ${p.name}\n${p.content}` 
+            });
+        }
+    }
+
+    console.log('[NovelGen] 发送给消息优化 API 的消息数组:', messages);
+
+    try {
+        log('正在通过 AI 进行消息优化...', 'info');
+        const optimizedResult = await callCustomApi(messages, {
+            model: settings.msgOptModel,
+            temperature: settings.msgOptTemp,
+            topP: settings.msgOptTopP,
+            topK: settings.msgOptTopK,
+            maxTokens: settings.msgOptMaxTokens
+        });
+        
+        if (optimizedResult && optimizedResult.trim()) {
+            log('消息优化完成，准备替换原文', 'success');
+            
+            let helper = window.TavernHelper;
+            if (helper && typeof helper.setChatMessages === 'function') {
+                await helper.setChatMessages([{
+                    message_id: lastAiIndex,
+                    message: optimizedResult.trim()
+                }]);
+                log('已成功替换消息(TavernHelper)', 'success');
+            } else if (typeof setChatMessages === 'function') {
+                await setChatMessages([{
+                    message_id: lastAiIndex,
+                    message: optimizedResult.trim()
+                }]);
+                log('已成功替换消息(Global)', 'success');
+            } else {
+                log('找不到 TavernHelper.setChatMessages 函数，无法替换消息', 'error');
+                toastr.error('找不到酒馆助手函数，无法替换消息');
+            }
+        } else {
+            log('消息优化返回内容为空', 'warning');
+        }
+    } catch (e) {
+        log('消息优化失败: ' + e.message, 'error');
+        toastr.error('消息优化失败: ' + e.message);
+    }
 }
 
 /**
@@ -1335,24 +1502,29 @@ async function exportAsJSON(silent = false) {
 // 预设条目管理
 // ============================================
 
-function renderPresets() {
-    const $list = $('#nag-preset-list');
-    $list.empty();
+function renderPresets() { renderGenericPresets('prompt'); }
+function renderMsgOptPresets() { renderGenericPresets('msgOpt'); }
 
-    // 确保数据结构正确并规范化优先级
-    if (!Array.isArray(settings.presets)) settings.presets = [];
-    settings.presets.sort((a, b) => (a.priority || 0) - (b.priority || 0));
-    settings.presets.forEach((p, i) => p.priority = i + 1);
+function renderGenericPresets(type) {
+    const isPrompt = type === 'prompt';
+    const arrName = isPrompt ? 'presets' : 'msgOptPresets';
+    const containerId = isPrompt ? 'nag-preset-list' : 'nag-msgopt-preset-list';
+    const $list = `#${containerId}`;
+    $($list).empty();
 
-    settings.presets.forEach((p, index) => {
+    if (!Array.isArray(settings[arrName])) settings[arrName] = [];
+    settings[arrName].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    settings[arrName].forEach((p, i) => p.priority = i + 1);
+
+    settings[arrName].forEach((p, index) => {
         const roleLabel = p.role ? `<span class="nag-preset-role-badge role-${p.role}">${p.role}</span>` : '';
         const isLocked = p.isLocked === true;
         const html = `
             <div class="nag-preset-item ${p.isHidden ? 'is-hidden' : ''} ${isLocked ? 'is-locked' : ''}" data-id="${p.id}">
                 <div class="nag-preset-drag-handle" title="调整顺序">
-                    <div class="nag-preset-order-btn move-up" data-id="${p.id}">▲</div>
+                    <div class="nag-preset-order-btn move-up-${type}" data-id="${p.id}">▲</div>
                     <div class="nag-preset-priority-num">${p.priority}</div>
-                    <div class="nag-preset-order-btn move-down" data-id="${p.id}">▼</div>
+                    <div class="nag-preset-order-btn move-down-${type}" data-id="${p.id}">▼</div>
                 </div>
                 <div class="nag-preset-main">
                     <span class="nag-preset-icon">${p.icon || '📝'}</span>
@@ -1362,94 +1534,100 @@ function renderPresets() {
                     </div>
                 </div>
                 <div class="nag-preset-actions">
-                    <div class="nag-preset-btn toggle-hidden ${p.isHidden ? 'is-hidden' : ''}" title="${p.isHidden ? '隐藏中 (不发送给AI)' : '显示中'}" data-id="${p.id}">
+                    <div class="nag-preset-btn toggle-hidden-${type} ${p.isHidden ? 'is-hidden' : ''}" title="${p.isHidden ? '隐藏中 (不发送给AI)' : '显示中'}" data-id="${p.id}">
                         ${p.isHidden ? '👁️‍🗨️' : '👁️'}
                     </div>
                     ${!isLocked ? `
-                        <div class="nag-preset-btn edit-item" title="编辑" data-id="${p.id}">✏️</div>
-                        <div class="nag-preset-btn delete-item" title="删除" data-id="${p.id}">🗑️</div>
+                        <div class="nag-preset-btn edit-item-${type}" title="编辑" data-id="${p.id}">✏️</div>
+                        <div class="nag-preset-btn delete-item-${type}" title="删除" data-id="${p.id}">🗑️</div>
                     ` : ''}
                     <label class="nag-switch" title="启用/禁用">
-                        <input type="checkbox" class="toggle-enabled" data-id="${p.id}" ${p.isEnabled ? 'checked' : ''}>
+                        <input type="checkbox" class="toggle-enabled-${type}" data-id="${p.id}" ${p.isEnabled ? 'checked' : ''}>
                         <span class="nag-slider"></span>
                     </label>
                 </div>
             </div>
         `;
-        $list.append(html);
+        $($list).append(html);
     });
 
-    // 绑定条目内部事件
-    $list.find('.move-up').on('click', function() {
+    $($list).find(`.move-up-${type}`).on('click', function() {
         const id = $(this).data('id');
-        const idx = settings.presets.findIndex(x => x.id == id);
+        const idx = settings[arrName].findIndex(x => x.id == id);
         if (idx > -1) {
-            const current = settings.presets[idx];
-            const targetIdx = settings.presets.findIndex(x => x.priority === current.priority - 1);
+            const current = settings[arrName][idx];
+            const targetIdx = settings[arrName].findIndex(x => x.priority === current.priority - 1);
             if (targetIdx > -1) {
-                settings.presets[targetIdx].priority++;
+                settings[arrName][targetIdx].priority++;
                 current.priority--;
                 saveSettings();
-                renderPresets();
+                renderGenericPresets(type);
             }
         }
     });
 
-    $list.find('.move-down').on('click', function() {
+    $($list).find(`.move-down-${type}`).on('click', function() {
         const id = $(this).data('id');
-        const idx = settings.presets.findIndex(x => x.id == id);
+        const idx = settings[arrName].findIndex(x => x.id == id);
         if (idx > -1) {
-            const current = settings.presets[idx];
-            const targetIdx = settings.presets.findIndex(x => x.priority === current.priority + 1);
+            const current = settings[arrName][idx];
+            const targetIdx = settings[arrName].findIndex(x => x.priority === current.priority + 1);
             if (targetIdx > -1) {
-                settings.presets[targetIdx].priority--;
+                settings[arrName][targetIdx].priority--;
                 current.priority++;
                 saveSettings();
-                renderPresets();
+                renderGenericPresets(type);
             }
         }
     });
-    $list.find('.toggle-hidden').on('click', function() {
+
+    $($list).find(`.toggle-hidden-${type}`).on('click', function() {
         const id = $(this).data('id');
-        const preset = settings.presets.find(x => x.id == id);
+        const preset = settings[arrName].find(x => x.id == id);
         if (preset) {
             preset.isHidden = !preset.isHidden;
             saveSettings();
-            renderPresets();
+            renderGenericPresets(type);
         }
     });
 
-    $list.find('.toggle-enabled').on('change', function() {
+    $($list).find(`.toggle-enabled-${type}`).on('change', function() {
         const id = $(this).data('id');
-        const preset = settings.presets.find(x => x.id == id);
+        const preset = settings[arrName].find(x => x.id == id);
         if (preset) {
             preset.isEnabled = $(this).prop('checked');
             saveSettings();
         }
     });
 
-    $list.find('.edit-item').on('click', function() {
+    $($list).find(`.edit-item-${type}`).on('click', function() {
         const id = $(this).data('id');
-        showPresetModal(id);
+        showGenericPresetModal(type, id);
     });
 
-    $list.find('.delete-item').on('click', function() {
+    $($list).find(`.delete-item-${type}`).on('click', function() {
         const id = $(this).data('id');
         if (confirm('确定要删除这个预设吗？')) {
-            settings.presets = settings.presets.filter(x => x.id != id);
+            settings[arrName] = settings[arrName].filter(x => x.id != id);
             saveSettings();
-            renderPresets();
+            renderGenericPresets(type);
         }
     });
 }
 
-function showPresetModal(id = null) {
+function showPresetModal(id = null) { showGenericPresetModal('prompt', id); }
+function showMsgOptPresetModal(id = null) { showGenericPresetModal('msgOpt', id); }
+
+function showGenericPresetModal(type, id = null) {
+    const isPrompt = type === 'prompt';
+    const arrName = isPrompt ? 'presets' : 'msgOptPresets';
+    
     const isEdit = id !== null;
-    const preset = isEdit ? settings.presets.find(x => x.id == id) : {
+    const preset = id !== null ? settings[arrName].find(x => x.id == id) : {
         name: '',
         content: '',
         icon: '📝',
-        priority: settings.presets.length + 1,
+        priority: (settings[arrName]?.length || 0) + 1,
         isEnabled: true,
         isHidden: false,
         role: 'system'
@@ -1524,15 +1702,15 @@ function showPresetModal(id = null) {
         };
 
         if (isEdit) {
-            const idx = settings.presets.findIndex(x => x.id == id);
-            settings.presets[idx] = newPreset;
+            const idx = settings[arrName].findIndex(x => x.id == id);
+            settings[arrName][idx] = newPreset;
         } else {
             newPreset.id = Date.now();
-            settings.presets.push(newPreset);
+            settings[arrName].push(newPreset);
         }
 
         saveSettings();
-        renderPresets();
+        renderGenericPresets(type);
         $modal.remove();
     });
 }
@@ -1542,7 +1720,7 @@ function showPresetModal(id = null) {
  * 汇总启用的预设，发送给自定义 API，获取结果
  */
 async function optimizePromptWithAI() {
-    if (!settings.apiUrl) {
+    if (!settings.apiEndpoints || settings.apiEndpoints.length === 0 || !settings.apiEndpoints.some(e => e.url)) {
         toastr.error('请先在 [自定义 API] 模块配置接口');
         return null;
     }
@@ -1604,7 +1782,13 @@ async function optimizePromptWithAI() {
 
     try {
         log('正在通过 AI 生成提示词...', 'info');
-        const optimized = await callCustomApi(messages);
+        const optimized = await callCustomApi(messages, {
+            model: settings.presetModel,
+            temperature: settings.presetTemp,
+            topP: settings.presetTopP,
+            topK: settings.presetTopK,
+            maxTokens: settings.presetMaxTokens
+        });
         if (optimized && optimized.trim()) {
             log('提示词生成成功', 'success');
             return optimized.trim();
@@ -1628,6 +1812,45 @@ function loadSettings() {
     
     if (!Array.isArray(settings.regexItems)) {
         settings.regexItems = [];
+    }
+
+    // API 配置迁移
+    if (!settings.apiEndpoints || settings.apiEndpoints.length === 0) {
+        settings.apiEndpoints = [{
+            id: 'default',
+            name: '默认 API',
+            url: settings.apiUrl || '',
+            key: settings.apiKey || '',
+            temp: settings.apiTemp || 0.7,
+            topP: settings.apiTopP || 1.0,
+            topK: settings.apiTopK || 0,
+            maxTokens: settings.apiMaxTokens || 4096,
+            extraParams: settings.apiExtraParams || ''
+        }];
+        settings.selectedApiEndpointId = 'default';
+        if (settings.apiModel && !settings.apiModel.includes(':::')) {
+            settings.apiModel = `default:::${settings.apiModel}`;
+        }
+    }
+
+    // 确保 msgOptPresets 存在
+    if (!Array.isArray(settings.msgOptPresets)) {
+        settings.msgOptPresets = defaultSettings.msgOptPresets;
+    } else {
+        const hasLatestAI = settings.msgOptPresets.some(p => p.id === 'latest_ai');
+        if (!hasLatestAI) {
+            settings.msgOptPresets.unshift({ 
+                id: 'latest_ai', 
+                name: "最新AI消息", 
+                content: "[LATEST_AI_MESSAGE]", 
+                isEnabled: true, 
+                isHidden: false, 
+                icon: "🤖", 
+                priority: 0, 
+                role: 'system', 
+                isLocked: true 
+            });
+        }
     }
 
     // 确保 history 预设存在
@@ -1657,6 +1880,28 @@ function saveSettings() {
     saveSettingsDebounced();
 }
 
+function renderApiEndpointSelect() {
+    const $select = $('#nag-api-endpoint-select');
+    $select.empty();
+    settings.apiEndpoints.forEach(e => {
+        $select.append(`<option value="${e.id}" ${e.id == settings.selectedApiEndpointId ? 'selected' : ''}>${escapeHtml(e.name || 'API节点')}</option>`);
+    });
+}
+
+function syncApiEndpointUI() {
+    const current = settings.apiEndpoints.find(e => e.id == settings.selectedApiEndpointId) || settings.apiEndpoints[0];
+    if (current) {
+        $('#nag-set-api-name').val(current.name);
+        $('#nag-set-api-url').val(current.url);
+        $('#nag-set-api-key').val(current.key);
+        $('#nag-set-api-temp').val(current.temp);
+        $('#nag-set-api-topp').val(current.topP);
+        $('#nag-set-api-topk').val(current.topK);
+        $('#nag-set-api-max-tokens').val(current.maxTokens);
+        $('#nag-set-api-extra').val(current.extraParams);
+    }
+}
+
 function updateUI() {
     const pct = settings.totalChapters > 0 ? (settings.currentChapter / settings.totalChapters * 100).toFixed(1) : 0;
     $('#nag-progress-fill').css('width', `${pct}%`);
@@ -1684,11 +1929,11 @@ function updateUI() {
     $('#nag-set-start-floor, #nag-set-end-floor').prop('disabled', settings.exportAll);
     $('#nag-floor-inputs').toggleClass('disabled', settings.exportAll);
     
-    // 发送阶段弹窗设置
+    // 发送阶段弹窗检测
     $('#nag-send-toast-settings').toggleClass('disabled', !settings.enableSendToastDetection);
     $('#nag-set-send-toast-timeout, #nag-set-send-post-toast-wait').prop('disabled', !settings.enableSendToastDetection);
     
-    // 回复阶段弹窗设置
+    // 回复阶段弹窗检测
     $('#nag-reply-toast-settings').toggleClass('disabled', !settings.enableReplyToastDetection);
     $('#nag-set-reply-toast-timeout, #nag-set-reply-post-toast-wait').prop('disabled', !settings.enableReplyToastDetection);
 }
@@ -1761,15 +2006,20 @@ function createUI() {
                                 <span>🚀 启用自定义 API (仅限自动生成)</span>
                             </label>
                         </div>
-                        <div class="nag-setting-item"><label>API URL</label><input type="text" id="nag-set-api-url" placeholder="https://api.openai.com/v1"></div>
-                        <div class="nag-setting-item"><label>API Key</label><input type="password" id="nag-set-api-key" placeholder="sk-..."></div>
+                        
                         <div class="nag-setting-item">
-                            <label>选择模型</label>
+                            <label>API 节点配置</label>
                             <div class="nag-setting-row">
-                                <select id="nag-set-api-model" style="flex: 1;"><option value="">-- 请先获取列表 --</option></select>
-                                <button id="nag-btn-fetch-models" class="menu_button_icon" title="获取模型列表" style="width: 40px;">🔄</button>
+                                <select id="nag-api-endpoint-select" style="flex: 1;"></select>
+                                <button id="nag-btn-add-api" class="menu_button_icon" title="添加新节点" style="width: 40px;">➕</button>
+                                <button id="nag-btn-delete-api" class="menu_button_icon" title="删除当前节点" style="width: 40px;">🗑️</button>
                             </div>
                         </div>
+                        
+                        <div class="nag-setting-item"><label>节点名称</label><input type="text" id="nag-set-api-name" placeholder="例如：OpenAI"></div>
+                        <div class="nag-setting-item"><label>API URL</label><input type="text" id="nag-set-api-url" placeholder="https://api.openai.com/v1"></div>
+                        <div class="nag-setting-item"><label>API Key</label><input type="password" id="nag-set-api-key" placeholder="sk-..."></div>
+                        
                         <div class="nag-setting-row">
                             <div class="nag-setting-item"><label>温度 (Temp)</label><input type="number" id="nag-set-api-temp" min="0" max="2" step="0.1"></div>
                             <div class="nag-setting-item"><label>Top P</label><input type="number" id="nag-set-api-topp" min="0" max="1" step="0.1"></div>
@@ -1782,9 +2032,67 @@ function createUI() {
                             <label>额外参数 (JSON)</label>
                             <textarea id="nag-set-api-extra" rows="2" placeholder='{"frequency_penalty": 0.5}'></textarea>
                         </div>
+                        
                         <div class="nag-btn-row">
-                            <button id="nag-btn-connect-api" class="menu_button">🔗 连接 API</button>
-                            <button id="nag-btn-test-api" class="menu_button">🧪 测试连接</button>
+                            <button id="nag-btn-test-api" class="menu_button">🧪 测试当前节点连接</button>
+                        </div>
+                        
+                        <hr style="opacity: 0.2; margin: 10px 0;">
+                        
+                        <div class="nag-setting-item">
+                            <label>选择模型 (合并所有节点)</label>
+                            <div class="nag-setting-row">
+                                <select id="nag-set-api-model" style="flex: 1;"><option value="">-- 请先获取列表 --</option></select>
+                                <button id="nag-btn-fetch-models" class="menu_button_icon" title="获取模型列表" style="width: 40px;">🔄</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 🪄 消息优化模块 -->
+                <div id="nag-panel-msgopt" class="nag-section nag-settings nag-collapsible">
+                    <div class="nag-panel-header" data-panel="msgopt">
+                        <span class="nag-panel-title">🪄 消息优化</span>
+                        <div class="nag-panel-actions">
+                            <span class="nag-help-btn" data-help="msgopt" title="帮助">❓</span>
+                            <span class="nag-collapse-icon">▼</span>
+                        </div>
+                    </div>
+                    <div class="nag-panel-content">
+                        <div class="nag-checkbox-group">
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="nag-set-msgopt-enabled">
+                                <span>✨ 启用酒馆AI消息优化</span>
+                            </label>
+                        </div>
+
+                        <div class="nag-setting-item">
+                            <label>模型选择 (优化处理器)</label>
+                            <div class="nag-setting-row">
+                                <select id="nag-set-msgopt-model" style="flex: 1;"><option value="">-- 请先在 API 模块获取 --</option></select>
+                            </div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>温度 (Temp)</label><input type="number" id="nag-set-msgopt-temp" min="0" max="2" step="0.1"></div>
+                            <div class="nag-setting-item"><label>Top P</label><input type="number" id="nag-set-msgopt-topp" min="0" max="1" step="0.1"></div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>Top K</label><input type="number" id="nag-set-msgopt-topk" min="0" step="1"></div>
+                            <div class="nag-setting-item"><label>最大 Token</label><input type="number" id="nag-set-msgopt-max-tokens" min="1" step="128"></div>
+                        </div>
+
+                        <div class="nag-setting-item">
+                            <label>系统提示词 (优化处理器)</label>
+                            <textarea id="nag-set-msgopt-system" rows="3"></textarea>
+                        </div>
+                        <div class="nag-preset-list-header">
+                            <div class="nag-btn-row">
+                                <button id="nag-btn-add-msgopt-preset" class="menu_button">➕ 添加预设</button>
+                                <button id="nag-btn-msgopt-optimize-now" class="menu_button">🪄 立即测试优化最新回复</button>
+                            </div>
+                        </div>
+                        <div id="nag-msgopt-preset-list" class="nag-preset-list">
+                            <!-- 消息优化预设条目动态加载 -->
                         </div>
                     </div>
                 </div>
@@ -1805,6 +2113,22 @@ function createUI() {
                                 <span>🧠 启用预设优化 (发送前由 AI 转换)</span>
                             </label>
                         </div>
+
+                        <div class="nag-setting-item">
+                            <label>模型选择 (预设处理器)</label>
+                            <div class="nag-setting-row">
+                                <select id="nag-set-preset-model" style="flex: 1;"><option value="">-- 请先在 API 模块获取 --</option></select>
+                            </div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>温度 (Temp)</label><input type="number" id="nag-set-preset-temp" min="0" max="2" step="0.1"></div>
+                            <div class="nag-setting-item"><label>Top P</label><input type="number" id="nag-set-preset-topp" min="0" max="1" step="0.1"></div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>Top K</label><input type="number" id="nag-set-preset-topk" min="0" step="1"></div>
+                            <div class="nag-setting-item"><label>最大 Token</label><input type="number" id="nag-set-preset-max-tokens" min="1" step="128"></div>
+                        </div>
+
                         <div class="nag-setting-item">
                             <label>系统提示词 (预设处理器)</label>
                             <textarea id="nag-set-preset-system" rows="3"></textarea>
@@ -2069,6 +2393,23 @@ function applyPanelStates() {
     });
 }
 
+async function onGenerationEnded(messageId) {
+    if (!settings.enableMsgOptimization || isOptimizing || messageId === lastOptimizedId) return;
+    
+    const stChat = getSTChat();
+    if (!stChat || !stChat[messageId]) return;
+    const msg = stChat[messageId];
+    if (msg.is_user || msg.is_human) return;
+    
+    try {
+        isOptimizing = true;
+        await performMessageOptimization(messageId, msg.mes);
+        lastOptimizedId = messageId;
+    } finally {
+        isOptimizing = false;
+    }
+}
+
 function bindEvents() {
     $('#nag-btn-start').on('click', startGeneration);
     $('#nag-btn-pause').on('click', pauseGeneration);
@@ -2080,8 +2421,44 @@ function bindEvents() {
     $('#nag-btn-refresh-floors').on('click', () => $('#nag-total-floors').text(getTotalFloors()));
     $('#nag-btn-refresh-preview').on('click', refreshPreview);
 
+    // 消息优化事件
+    $('#nag-set-msgopt-enabled').on('change', function() { settings.enableMsgOptimization = $(this).prop('checked'); saveSettings(); });
+    $('#nag-set-msgopt-model').on('change', function() { settings.msgOptModel = $(this).val(); saveSettings(); });
+    $('#nag-set-msgopt-temp').on('change', function() { settings.msgOptTemp = +$(this).val(); saveSettings(); });
+    $('#nag-set-msgopt-topp').on('change', function() { settings.msgOptTopP = +$(this).val(); saveSettings(); });
+    $('#nag-set-msgopt-topk').on('change', function() { settings.msgOptTopK = +$(this).val(); saveSettings(); });
+    $('#nag-set-msgopt-max-tokens').on('change', function() { settings.msgOptMaxTokens = +$(this).val(); saveSettings(); });
+    $('#nag-set-msgopt-system').on('change', function() { settings.msgOptSystemPrompt = $(this).val(); saveSettings(); });
+    $('#nag-btn-add-msgopt-preset').on('click', () => showMsgOptPresetModal());
+    $('#nag-btn-msgopt-optimize-now').on('click', async () => {
+        const stChat = getSTChat();
+        let lastAiIndex = -1;
+        let rawContent = '';
+        if (stChat) {
+            for (let i = stChat.length - 1; i >= 0; i--) {
+                const msg = stChat[i];
+                if (msg && !msg.is_user && !msg.is_human && msg.mes) {
+                    rawContent = msg.mes;
+                    lastAiIndex = i;
+                    break;
+                }
+            }
+        }
+        if (lastAiIndex !== -1 && rawContent) {
+            await performMessageOptimization(lastAiIndex, rawContent);
+            toastr.success('消息优化已完成并替换');
+        } else {
+            toastr.warning('未找到 AI 消息');
+        }
+    });
+
     // 预设相关事件
     $('#nag-set-preset-enabled').on('change', function() { settings.enablePresetOptimization = $(this).prop('checked'); saveSettings(); });
+    $('#nag-set-preset-model').on('change', function() { settings.presetModel = $(this).val(); saveSettings(); });
+    $('#nag-set-preset-temp').on('change', function() { settings.presetTemp = +$(this).val(); saveSettings(); });
+    $('#nag-set-preset-topp').on('change', function() { settings.presetTopP = +$(this).val(); saveSettings(); });
+    $('#nag-set-preset-topk').on('change', function() { settings.presetTopK = +$(this).val(); saveSettings(); });
+    $('#nag-set-preset-max-tokens').on('change', function() { settings.presetMaxTokens = +$(this).val(); saveSettings(); });
     $('#nag-set-preset-system').on('change', function() { settings.presetSystemPrompt = $(this).val(); saveSettings(); });
     $('#nag-btn-add-preset').on('click', () => showPresetModal());
     $('#nag-btn-optimize-now').on('click', async () => {
@@ -2099,17 +2476,52 @@ function bindEvents() {
     $('#nag-btn-add-regex').on('click', () => showRegexModal());
     
     // API 设置事件
-    $('#nag-set-api-url').on('change', function() { settings.apiUrl = $(this).val(); saveSettings(); });
-    $('#nag-set-api-key').on('change', function() { settings.apiKey = $(this).val(); saveSettings(); });
-    $('#nag-set-api-model').on('change', function() { settings.apiModel = $(this).val(); saveSettings(); });
-    $('#nag-set-api-temp').on('change', function() { settings.apiTemp = +$(this).val(); saveSettings(); });
-    $('#nag-set-api-topp').on('change', function() { settings.apiTopP = +$(this).val(); saveSettings(); });
-    $('#nag-set-api-topk').on('change', function() { settings.apiTopK = +$(this).val(); saveSettings(); });
-    $('#nag-set-api-max-tokens').on('change', function() { settings.apiMaxTokens = +$(this).val(); saveSettings(); });
-    $('#nag-set-api-extra').on('change', function() { settings.apiExtraParams = $(this).val(); saveSettings(); });
     $('#nag-set-api-enabled').on('change', function() { settings.apiEnabled = $(this).prop('checked'); saveSettings(); });
+    $('#nag-api-endpoint-select').on('change', function() { 
+        settings.selectedApiEndpointId = $(this).val(); 
+        syncApiEndpointUI(); 
+        saveSettings(); 
+    });
+    $('#nag-btn-add-api').on('click', function() {
+        const id = Date.now().toString();
+        settings.apiEndpoints.push({
+            id, name: `API节点 ${settings.apiEndpoints.length + 1}`, url: '', key: '',
+            temp: 0.7, topP: 1.0, topK: 0, maxTokens: 4096, extraParams: ''
+        });
+        settings.selectedApiEndpointId = id;
+        saveSettings();
+        renderApiEndpointSelect();
+        syncApiEndpointUI();
+    });
+    $('#nag-btn-delete-api').on('click', function() {
+        if (settings.apiEndpoints.length <= 1) {
+            toastr.warning('必须保留至少一个 API 节点');
+            return;
+        }
+        if (confirm('确定要删除当前选择的 API 节点吗？')) {
+            settings.apiEndpoints = settings.apiEndpoints.filter(e => e.id != settings.selectedApiEndpointId);
+            settings.selectedApiEndpointId = settings.apiEndpoints[0].id;
+            saveSettings();
+            renderApiEndpointSelect();
+            syncApiEndpointUI();
+        }
+    });
+
+    const updateCurrentEndpoint = (key, val) => {
+        const current = settings.apiEndpoints.find(e => e.id == settings.selectedApiEndpointId);
+        if (current) { current[key] = val; saveSettings(); }
+    };
+    $('#nag-set-api-name').on('change', function() { updateCurrentEndpoint('name', $(this).val()); renderApiEndpointSelect(); });
+    $('#nag-set-api-url').on('change', function() { updateCurrentEndpoint('url', $(this).val()); });
+    $('#nag-set-api-key').on('change', function() { updateCurrentEndpoint('key', $(this).val()); });
+    $('#nag-set-api-temp').on('change', function() { updateCurrentEndpoint('temp', +$(this).val()); });
+    $('#nag-set-api-topp').on('change', function() { updateCurrentEndpoint('topP', +$(this).val()); });
+    $('#nag-set-api-topk').on('change', function() { updateCurrentEndpoint('topK', +$(this).val()); });
+    $('#nag-set-api-max-tokens').on('change', function() { updateCurrentEndpoint('maxTokens', +$(this).val()); });
+    $('#nag-set-api-extra').on('change', function() { updateCurrentEndpoint('extraParams', $(this).val()); });
+    
+    $('#nag-set-api-model').on('change', function() { settings.apiModel = $(this).val(); saveSettings(); });
     $('#nag-btn-fetch-models').on('click', fetchApiModels);
-    $('#nag-btn-connect-api').on('click', fetchApiModels);
     $('#nag-btn-test-api').on('click', testApiConnection);
 
     // TXT转世界书入口
@@ -2197,7 +2609,7 @@ function bindEvents() {
         refreshPreview(); 
     });
     $('#nag-set-separator').on('change', function() { 
-        settings.tagSeparator = $(this).val().replace(/\\n/g, '\n'); 
+        settings.tagSeparator = $(this).val().replace(/\\\\n/g, '\n'); 
         saveSettings(); 
     });
     
@@ -2217,18 +2629,9 @@ function bindEvents() {
     });
     
     // 回复阶段设置
-    $('#nag-set-reply-wait').on('change', function() { 
-        settings.replyWaitTime = +$(this).val() || 5000; 
-        saveSettings(); 
-    });
-    $('#nag-set-stability-interval').on('change', function() { 
-        settings.stabilityCheckInterval = +$(this).val() || 1000; 
-        saveSettings(); 
-    });
-    $('#nag-set-stability-count').on('change', function() { 
-        settings.stabilityRequiredCount = +$(this).val() || 3; 
-        saveSettings(); 
-    });
+    $('#nag-set-reply-wait').on('change', function() { settings.replyWaitTime = +$(this).val() || 5000; saveSettings(); });
+    $('#nag-set-stability-interval').on('change', function() { settings.stabilityCheckInterval = +$(this).val() || 1000; saveSettings(); });
+    $('#nag-set-stability-count').on('change', function() { settings.stabilityRequiredCount = +$(this).val() || 3; saveSettings(); });
     $('#nag-set-reply-toast-detection').on('change', function() { 
         settings.enableReplyToastDetection = $(this).prop('checked'); 
         updateUI();
@@ -2268,8 +2671,23 @@ function bindEvents() {
 }
 
 function syncUI() {
+    // 消息优化同步
+    $('#nag-set-msgopt-enabled').prop('checked', settings.enableMsgOptimization);
+    $('#nag-set-msgopt-model').val(settings.msgOptModel);
+    $('#nag-set-msgopt-temp').val(settings.msgOptTemp);
+    $('#nag-set-msgopt-topp').val(settings.msgOptTopP);
+    $('#nag-set-msgopt-topk').val(settings.msgOptTopK);
+    $('#nag-set-msgopt-max-tokens').val(settings.msgOptMaxTokens);
+    $('#nag-set-msgopt-system').val(settings.msgOptSystemPrompt);
+    renderMsgOptPresets();
+
     // 预设同步
     $('#nag-set-preset-enabled').prop('checked', settings.enablePresetOptimization);
+    $('#nag-set-preset-model').val(settings.presetModel);
+    $('#nag-set-preset-temp').val(settings.presetTemp);
+    $('#nag-set-preset-topp').val(settings.presetTopP);
+    $('#nag-set-preset-topk').val(settings.presetTopK);
+    $('#nag-set-preset-max-tokens').val(settings.presetMaxTokens);
     $('#nag-set-preset-system').val(settings.presetSystemPrompt);
     renderPresets();
 
@@ -2279,20 +2697,29 @@ function syncUI() {
 
     // API 设置
     $('#nag-set-api-enabled').prop('checked', settings.apiEnabled);
-    $('#nag-set-api-url').val(settings.apiUrl);
-    $('#nag-set-api-key').val(settings.apiKey);
-    $('#nag-set-api-temp').val(settings.apiTemp);
-    $('#nag-set-api-topp').val(settings.apiTopP);
-    $('#nag-set-api-topk').val(settings.apiTopK);
-    $('#nag-set-api-max-tokens').val(settings.apiMaxTokens);
-    $('#nag-set-api-extra').val(settings.apiExtraParams);
+    renderApiEndpointSelect();
+    syncApiEndpointUI();
     
-    if (settings.apiUrl && settings.apiKey) {
-        // 如果有设置，尝试填充模型下拉列表（这里只填充当前已保存的模型，或者提示用户刷新）
-        const $select = $('#nag-set-api-model');
-        if (settings.apiModel) {
-            $select.empty().append(`<option value="${settings.apiModel}" selected>${settings.apiModel}</option>`);
-        }
+    const $selectModel = $('#nag-set-api-model');
+    const $selectMsgOptModel = $('#nag-set-msgopt-model');
+    const $selectPresetModel = $('#nag-set-preset-model');
+    
+    if (settings.apiModel) {
+        const parts = settings.apiModel.split(':::');
+        const modelName = parts.length > 1 ? parts.slice(1).join(':::') : settings.apiModel;
+        $selectModel.empty().append(`<option value="${settings.apiModel}" selected>${modelName}</option>`);
+    }
+    
+    if (settings.msgOptModel) {
+        const parts = settings.msgOptModel.split(':::');
+        const modelName = parts.length > 1 ? parts.slice(1).join(':::') : settings.msgOptModel;
+        $selectMsgOptModel.empty().append(`<option value="${settings.msgOptModel}" selected>${modelName}</option>`);
+    }
+
+    if (settings.presetModel) {
+        const parts = settings.presetModel.split(':::');
+        const modelName = parts.length > 1 ? parts.slice(1).join(':::') : settings.presetModel;
+        $selectPresetModel.empty().append(`<option value="${settings.presetModel}" selected>${modelName}</option>`);
     }
 
     // 生成设置
@@ -2310,7 +2737,7 @@ function syncUI() {
     // 标签提取
     $('#nag-set-extract-mode').val(settings.extractMode);
     $('#nag-set-tags').val(settings.extractTags);
-    $('#nag-set-separator').val(settings.tagSeparator.replace(/\n/g, '\\n'));
+    $('#nag-set-separator').val(settings.tagSeparator.replace(/\n/g, '\\\\n'));
     
     // 发送阶段弹窗检测
     $('#nag-set-send-toast-detection').prop('checked', settings.enableSendToastDetection);
@@ -2341,6 +2768,19 @@ function syncUI() {
 jQuery(async () => {
     loadSettings();
     createUI();
+    
+    try {
+        if (typeof SillyTavern !== 'undefined' && typeof eventOn === 'function') {
+            const ctx = SillyTavern.getContext();
+            const tavern_events = ctx.tavern_events;
+            if (tavern_events && tavern_events.GENERATION_ENDED) {
+                eventOn(tavern_events.GENERATION_ENDED, onGenerationEnded);
+            }
+        }
+    } catch(e) {
+        log('注册生成结束监听失败: ' + e.message, 'warning');
+    }
+
     setInterval(() => { if (settings.isRunning) updateUI(); }, 1000);
     log('扩展已加载', 'success');
 });
