@@ -41,11 +41,37 @@ const defaultSettings = {
     tagSeparator: '\n\n',
     
     panelCollapsed: {
+        api: false,
+        presets: false,
         generate: false,
         export: false,
         extract: true,
         advanced: true,
     },
+
+    // API 设置
+    apiUrl: '',
+    apiKey: '',
+    apiModel: '',
+    apiTemp: 0.7,
+    apiTopP: 1.0,
+    apiTopK: 0,
+    apiMaxTokens: 4096,
+    apiExtraParams: '',
+    apiEnabled: false,
+
+    // 提示词预设
+    enablePresetOptimization: false,
+    presetSystemPrompt: "请根据以下预设条目和当前的续写需求，生成一段具体的、发给小说续写AI的指令（Prompt）。要求：1. 只有正文 2. 包含具体的剧情走向建议 3. 保持文风一致性。",
+    presets: [
+        { id: 'history', name: "酒馆聊天历史", content: "[CHAT_HISTORY]", isEnabled: false, isHidden: false, icon: "📜", priority: 0, role: 'system', isLocked: true },
+        { id: 1, name: "剧情连贯性", content: "注意前文伏笔，确保逻辑严密。", isEnabled: true, isHidden: false, icon: "🧩", priority: 1, role: 'system' },
+        { id: 2, name: "人物性格", content: "保持角色性格鲜明，说话语气符合人设。", isEnabled: true, isHidden: false, icon: "👤", priority: 2, role: 'system' }
+    ],
+
+    // 正则替换设置
+    enableRegexProcessing: false,
+    regexItems: [],
 };
 
 let settings = {};
@@ -262,6 +288,53 @@ function showHelp(topic) {
 <p>用空格、逗号分隔：<code>content detail 正文</code></p>
 <h4>📌 调试</h4>
 <p>控制台输入 <code>nagDebug()</code></p>
+            `
+        },
+        api: {
+            title: '🌐 自定义 API 说明',
+            content: `
+<h4>📌 API URL</h4>
+<p>OpenAI 兼容接口的地址，通常以 <code>/v1</code> 结尾。</p>
+<h4>📌 API Key</h4>
+<p>您的 API 密钥。</p>
+<h4>📌 模型获取</h4>
+<p>点击 🔄 按钮获取可用的模型列表。</p>
+<h4>📌 参数设置</h4>
+<ul>
+    <li><b>温度 (Temp)</b>：控制随机性，越高越放飞。</li>
+    <li><b>Top P</b>：核采样阈值。</li>
+    <li><b>Top K</b>：采样候选集大小。</li>
+</ul>
+            `
+        },
+        presets: {
+            title: '🎭 提示词预设说明',
+            content: `
+<h4>📌 什么是预设优化？</h4>
+<p>在发送消息给酒馆 AI 之前，先将你开启的多个“预设条目”汇总，并发送给你配置的“自定义 API”进行转换。转换后的结果将作为最终提示词发送。</p>
+<h4>📌 核心功能</h4>
+<ul>
+    <li><b>👁️ 隐藏开关</b>：点击眼睛图标可暂时隐藏条目，该条目内容将不会发送给 AI 转换。</li>
+    <li><b>启用开关</b>：右侧绿色开关控制条目是否生效。</li>
+    <li><b>🪄 立即转换</b>：手动触发 AI 优化，预览转换后的提示词结果。</li>
+    <li><b>排序</b>：根据左侧的优先级数字决定条目汇总时的先后顺序。</li>
+</ul>
+<h4>📌 使用建议</h4>
+<p>建议使用速度快、上下文理解能力较好的模型作为预设处理器（如 GPT-3.5/4o-mini 或国产高速模型）。</p>
+            `
+        },
+        regex: {
+            title: '🧩 正则替换说明',
+            content: `
+<h4>📌 功能说明</h4>
+<p>在这里可以添加正则表达式，用于处理特定范围内的文本内容。</p>
+<h4>📌 作用范围</h4>
+<ul>
+    <li><b>历史条目中的所有 system 条目</b>：在发送给自定义 API 进行“预设优化”时，对历史聊天记录中的系统(System)消息进行正则替换。</li>
+    <li><b>自定义 AI 输出</b>：对自定义 API 返回的所有结果进行正则替换，包括直接生成的续写内容以及预设优化生成的提示词。</li>
+</ul>
+<h4>📌 编写规则</h4>
+<p>可以使用 <code>/pattern/flags</code> 的格式（例如 <code>/\\n+/g</code>），如果直接填写文本则默认使用 <code>g</code> 全局替换。替换内容中的 <code>\\n</code> 和 <code>\\t</code> 会被解析为换行符和制表符。</p>
             `
         },
         advanced: {
@@ -521,6 +594,403 @@ async function waitForToastsClear(timeout, postWaitTime, phase = '') {
 }
 
 // ============================================
+// 正则条目管理与替换逻辑
+// ============================================
+
+function applyRegexes(text, scope) {
+    if (!settings.enableRegexProcessing || !settings.regexItems || !settings.regexItems.length || !text) {
+        return text;
+    }
+
+    let result = text;
+    const activeRegexes = settings.regexItems
+        .filter(r => r.isEnabled)
+        .sort((a, b) => (a.priority || 0) - (b.priority || 0));
+
+    for (const r of activeRegexes) {
+        let applies = false;
+        if (scope === 'system' && r.scopeSystem) applies = true;
+        if (scope === 'ai' && r.scopeCustomAI) applies = true;
+        
+        if (applies && r.regex) {
+            try {
+                let pattern = r.regex;
+                let flags = 'g';
+                if (pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
+                    const lastSlash = pattern.lastIndexOf('/');
+                    flags = pattern.substring(lastSlash + 1);
+                    pattern = pattern.substring(1, lastSlash);
+                }
+                const regex = new RegExp(pattern, flags);
+                let rep = r.replacement || '';
+                rep = rep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+                
+                result = result.replace(regex, rep);
+            } catch (e) {
+                console.warn(`[NovelGen] 正则 [${r.name}] 执行失败:`, e);
+            }
+        }
+    }
+    return result;
+}
+
+function renderRegexItems() {
+    const $list = $('#nag-regex-list');
+    if (!$list.length) return;
+    $list.empty();
+
+    if (!Array.isArray(settings.regexItems)) settings.regexItems = [];
+    settings.regexItems.sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    settings.regexItems.forEach((r, i) => r.priority = i + 1);
+
+    settings.regexItems.forEach((r) => {
+        let scopeBadges = '';
+        if (r.scopeSystem) scopeBadges += '<span class="nag-preset-role-badge role-system" style="margin-right:2px;">System</span>';
+        if (r.scopeCustomAI) scopeBadges += '<span class="nag-preset-role-badge role-assistant">AI输出</span>';
+
+        const html = `
+            <div class="nag-preset-item" data-id="${r.id}">
+                <div class="nag-preset-drag-handle" title="调整顺序">
+                    <div class="nag-preset-order-btn move-up-regex" data-id="${r.id}">▲</div>
+                    <div class="nag-preset-priority-num">${r.priority}</div>
+                    <div class="nag-preset-order-btn move-down-regex" data-id="${r.id}">▼</div>
+                </div>
+                <div class="nag-preset-main">
+                    <span class="nag-preset-icon">🧩</span>
+                    <div class="nag-preset-info">
+                        <span class="nag-preset-name" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</span>
+                        <div style="display:flex;gap:4px;margin-top:2px;">${scopeBadges}</div>
+                    </div>
+                </div>
+                <div class="nag-preset-actions">
+                    <div class="nag-preset-btn edit-regex" title="编辑" data-id="${r.id}">✏️</div>
+                    <div class="nag-preset-btn delete-regex" title="删除" data-id="${r.id}">🗑️</div>
+                    <label class="nag-switch" title="启用/禁用">
+                        <input type="checkbox" class="toggle-regex-enabled" data-id="${r.id}" ${r.isEnabled ? 'checked' : ''}>
+                        <span class="nag-slider"></span>
+                    </label>
+                </div>
+            </div>
+        `;
+        $list.append(html);
+    });
+
+    $list.find('.move-up-regex').on('click', function() {
+        const id = $(this).data('id');
+        const idx = settings.regexItems.findIndex(x => x.id == id);
+        if (idx > -1) {
+            const current = settings.regexItems[idx];
+            const targetIdx = settings.regexItems.findIndex(x => x.priority === current.priority - 1);
+            if (targetIdx > -1) {
+                settings.regexItems[targetIdx].priority++;
+                current.priority--;
+                saveSettings();
+                renderRegexItems();
+            }
+        }
+    });
+
+    $list.find('.move-down-regex').on('click', function() {
+        const id = $(this).data('id');
+        const idx = settings.regexItems.findIndex(x => x.id == id);
+        if (idx > -1) {
+            const current = settings.regexItems[idx];
+            const targetIdx = settings.regexItems.findIndex(x => x.priority === current.priority + 1);
+            if (targetIdx > -1) {
+                settings.regexItems[targetIdx].priority--;
+                current.priority++;
+                saveSettings();
+                renderRegexItems();
+            }
+        }
+    });
+
+    $list.find('.toggle-regex-enabled').on('change', function() {
+        const id = $(this).data('id');
+        const item = settings.regexItems.find(x => x.id == id);
+        if (item) {
+            item.isEnabled = $(this).prop('checked');
+            saveSettings();
+        }
+    });
+
+    $list.find('.edit-regex').on('click', function() {
+        const id = $(this).data('id');
+        showRegexModal(id);
+    });
+
+    $list.find('.delete-regex').on('click', function() {
+        const id = $(this).data('id');
+        if (confirm('确定要删除这个正则条目吗？')) {
+            settings.regexItems = settings.regexItems.filter(x => x.id != id);
+            saveSettings();
+            renderRegexItems();
+        }
+    });
+}
+
+function showRegexModal(id = null) {
+    const isEdit = id !== null;
+    const rItem = isEdit ? settings.regexItems.find(x => x.id == id) : {
+        name: '',
+        regex: '',
+        replacement: '',
+        scopeSystem: true,
+        scopeCustomAI: true,
+        isEnabled: true,
+        priority: (settings.regexItems?.length || 0) + 1
+    };
+
+    const valName = rItem.name.replace(/"/g, '"');
+
+    const modalHtml = `
+        <div class="nag-modal-container" id="nag-regex-modal">
+            <div class="nag-modal">
+                <div class="nag-modal-header">
+                    <span class="nag-modal-title">${isEdit ? '编辑正则' : '添加正则'}</span>
+                    <button class="nag-modal-close">✕</button>
+                </div>
+                <div class="nag-modal-body">
+                    <div class="nag-setting-item">
+                        <label>条目名称</label>
+                        <input type="text" id="modal-regex-name" value="${valName}" placeholder="例如：去除多余空行">
+                    </div>
+                    <div class="nag-setting-item">
+                        <label>正则内容</label>
+                        <textarea id="modal-regex-content" rows="3" placeholder="例如：\\n{3,}"></textarea>
+                    </div>
+                    <div class="nag-setting-item">
+                        <label>替换成</label>
+                        <textarea id="modal-regex-replacement" rows="3" placeholder="例如：\\n\\n"></textarea>
+                    </div>
+                    <div class="nag-setting-item">
+                        <label>作用范围</label>
+                        <div class="nag-checkbox-group">
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="modal-regex-scope-system" ${rItem.scopeSystem ? 'checked' : ''}>
+                                <span>历史条目中的所有 system 条目</span>
+                            </label>
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="modal-regex-scope-ai" ${rItem.scopeCustomAI ? 'checked' : ''}>
+                                <span>自定义 AI 输出</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="nag-btn-row">
+                        <button id="modal-regex-save" class="menu_button">${isEdit ? '保存' : '创建'}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    $('body').append(modalHtml);
+    const $modal = $('#nag-regex-modal');
+    
+    $('#modal-regex-content').val(rItem.regex);
+    $('#modal-regex-replacement').val(rItem.replacement);
+
+    $modal.find('.nag-modal-close').on('click', () => $modal.remove());
+    $modal.find('#modal-regex-save').on('click', () => {
+        const name = $('#modal-regex-name').val().trim();
+        const regex = $('#modal-regex-content').val();
+        const replacement = $('#modal-regex-replacement').val();
+        const scopeSystem = $('#modal-regex-scope-system').prop('checked');
+        const scopeCustomAI = $('#modal-regex-scope-ai').prop('checked');
+
+        if (!name || !regex) {
+            toastr.warning('名称和正则内容不能为空');
+            return;
+        }
+
+        if (!scopeSystem && !scopeCustomAI) {
+            toastr.warning('至少选择一个作用范围');
+            return;
+        }
+
+        try {
+            let pattern = regex;
+            let flags = '';
+            if (pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
+                const lastSlash = pattern.lastIndexOf('/');
+                flags = pattern.substring(lastSlash + 1);
+                pattern = pattern.substring(1, lastSlash);
+            }
+            new RegExp(pattern, flags);
+        } catch (e) {
+            toastr.error('正则表达式语法错误: ' + e.message);
+            return;
+        }
+
+        const newItem = {
+            ...rItem,
+            name,
+            regex,
+            replacement,
+            scopeSystem,
+            scopeCustomAI
+        };
+
+        if (!settings.regexItems) settings.regexItems = [];
+        
+        if (isEdit) {
+            const idx = settings.regexItems.findIndex(x => x.id == id);
+            settings.regexItems[idx] = newItem;
+        } else {
+            newItem.id = Date.now();
+            settings.regexItems.push(newItem);
+        }
+
+        saveSettings();
+        renderRegexItems();
+        $modal.remove();
+    });
+}
+
+// ============================================
+// API 调用逻辑
+// ============================================
+
+async function fetchApiModels() {
+    const url = settings.apiUrl;
+    const key = settings.apiKey;
+
+    if (!url) {
+        toastr.error('请先设置 API URL');
+        return;
+    }
+
+    try {
+        log('正在获取模型列表...', 'info');
+        const response = await fetch(`${url.replace(/\/+$/, '')}/models`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${key}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const models = data.data || [];
+        
+        const $select = $('#nag-set-api-model');
+        const currentModel = settings.apiModel;
+        
+        $select.empty();
+        $select.append('<option value="">-- 请选择模型 --</option>');
+        
+        models.forEach(m => {
+            const id = m.id || m;
+            $select.append(`<option value="${id}" ${id === currentModel ? 'selected' : ''}>${id}</option>`);
+        });
+
+        toastr.success(`成功获取 ${models.length} 个模型`);
+        log(`成功获取 ${models.length} 个模型`, 'success');
+    } catch (e) {
+        log(`获取模型列表失败: ${e.message}`, 'error');
+        toastr.error(`获取模型列表失败: ${e.message}`);
+    }
+}
+
+async function testApiConnection() {
+    const url = settings.apiUrl;
+    const key = settings.apiKey;
+    const model = settings.apiModel;
+
+    if (!url || !model) {
+        toastr.error('请确保已设置 URL 并选择了模型');
+        return;
+    }
+
+    try {
+        log('正在测试连接...', 'info');
+        const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${key}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: model,
+                messages: [{ role: 'user', content: 'hi' }],
+                max_tokens: 10
+            })
+        });
+
+        if (response.ok) {
+            toastr.success('连接测试成功！');
+            log('连接测试成功', 'success');
+        } else {
+            const err = await response.text();
+            throw new Error(`HTTP ${response.status}: ${err}`);
+        }
+    } catch (e) {
+        log(`连接测试失败: ${e.message}`, 'error');
+        toastr.error(`连接测试失败: ${e.message}`);
+    }
+}
+
+async function callCustomApi(messages) {
+    const url = settings.apiUrl;
+    const key = settings.apiKey;
+    const model = settings.apiModel;
+
+    if (!url || !model) {
+        throw new Error('请确保已设置 API URL 并选择了模型');
+    }
+
+    // 处理输入，支持字符串或消息数组
+    const finalMessages = Array.isArray(messages) ? messages : [{ role: 'user', content: messages }];
+    
+    // 打印发送的消息到 F12
+    console.log('[NovelGen] 发送给 API 的消息数组:', finalMessages);
+
+    let extraParams = {};
+    if (settings.apiExtraParams) {
+        try {
+            extraParams = JSON.parse(settings.apiExtraParams);
+        } catch (e) {
+            log('解析额外参数失败，请检查 JSON 格式: ' + e.message, 'warning');
+        }
+    }
+
+    const body = {
+        model: model,
+        messages: finalMessages,
+        temperature: settings.apiTemp,
+        top_p: settings.apiTopP,
+        max_tokens: settings.apiMaxTokens,
+        ...extraParams
+    };
+    
+    if (settings.apiTopK > 0) {
+        body.top_k = settings.apiTopK;
+    }
+
+    const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${key}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`API 错误 (${response.status}): ${err}`);
+    }
+
+    const data = await response.json();
+    let resultContent = data.choices?.[0]?.message?.content || '';
+    return applyRegexes(resultContent, 'ai');
+}
+
+// ============================================
 // 核心生成逻辑
 // ============================================
 
@@ -670,10 +1140,40 @@ async function waitForAIResponse(prevCount) {
  * 生成单章
  */
 async function generateSingleChapter(num) {
+    let textToSend = settings.prompt;
+
+    // 发送给酒馆前，如果启用了 ai提示词生成，让 AI 根据预设生成提示词
+    if (settings.enablePresetOptimization) {
+        log(`正在使用自定义 API 生成提示词...`, 'info');
+        const generatedPrompt = await optimizePromptWithAI();
+        if (generatedPrompt) {
+            textToSend = generatedPrompt;
+            // 将生成的内容放入提示词输入框并保存
+            settings.prompt = textToSend;
+            $('#nag-set-prompt').val(textToSend);
+            saveSettings();
+        } else {
+            throw new Error('自定义 API 生成提示词为空');
+        }
+    } else if (settings.apiEnabled) {
+        // 未启用 ai提示词生成 但启用了自定义 API 时，直接使用提示词调用 API
+        log(`正在使用自定义 API 生成发送内容...`, 'info');
+        const reply = await callCustomApi(settings.prompt);
+        if (reply && reply.trim()) {
+            textToSend = reply.trim();
+            // 将生成的内容放入提示词输入框并保存
+            settings.prompt = textToSend;
+            $('#nag-set-prompt').val(textToSend);
+            saveSettings();
+        } else {
+            throw new Error('自定义 API 返回内容为空');
+        }
+    }
+
     const prevCount = getAIMessageCountRobust();
     
     // 发送消息
-    await sendMessage(settings.prompt);
+    await sendMessage(textToSend);
     
     // 等待回复完成
     const length = await waitForAIResponse(prevCount);
@@ -746,15 +1246,10 @@ async function startGeneration() {
             
             if (abortGeneration) break;
             if (!success) settings.currentChapter = i + 1;
-            
-            if (settings.currentChapter % settings.autoSaveInterval === 0) {
-                await exportNovel(true);
-            }
         }
         
         if (!abortGeneration) { 
             toastr.success('生成完成!'); 
-            await exportNovel(false); 
         }
     } finally {
         settings.isRunning = false; 
@@ -837,6 +1332,292 @@ async function exportAsJSON(silent = false) {
 }
 
 // ============================================
+// 预设条目管理
+// ============================================
+
+function renderPresets() {
+    const $list = $('#nag-preset-list');
+    $list.empty();
+
+    // 确保数据结构正确并规范化优先级
+    if (!Array.isArray(settings.presets)) settings.presets = [];
+    settings.presets.sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    settings.presets.forEach((p, i) => p.priority = i + 1);
+
+    settings.presets.forEach((p, index) => {
+        const roleLabel = p.role ? `<span class="nag-preset-role-badge role-${p.role}">${p.role}</span>` : '';
+        const isLocked = p.isLocked === true;
+        const html = `
+            <div class="nag-preset-item ${p.isHidden ? 'is-hidden' : ''} ${isLocked ? 'is-locked' : ''}" data-id="${p.id}">
+                <div class="nag-preset-drag-handle" title="调整顺序">
+                    <div class="nag-preset-order-btn move-up" data-id="${p.id}">▲</div>
+                    <div class="nag-preset-priority-num">${p.priority}</div>
+                    <div class="nag-preset-order-btn move-down" data-id="${p.id}">▼</div>
+                </div>
+                <div class="nag-preset-main">
+                    <span class="nag-preset-icon">${p.icon || '📝'}</span>
+                    <div class="nag-preset-info">
+                        <span class="nag-preset-name" title="${p.name}${isLocked ? ' (内置不可编辑)' : ''}">${p.name}${isLocked ? ' 🔒' : ''}</span>
+                        ${roleLabel}
+                    </div>
+                </div>
+                <div class="nag-preset-actions">
+                    <div class="nag-preset-btn toggle-hidden ${p.isHidden ? 'is-hidden' : ''}" title="${p.isHidden ? '隐藏中 (不发送给AI)' : '显示中'}" data-id="${p.id}">
+                        ${p.isHidden ? '👁️‍🗨️' : '👁️'}
+                    </div>
+                    ${!isLocked ? `
+                        <div class="nag-preset-btn edit-item" title="编辑" data-id="${p.id}">✏️</div>
+                        <div class="nag-preset-btn delete-item" title="删除" data-id="${p.id}">🗑️</div>
+                    ` : ''}
+                    <label class="nag-switch" title="启用/禁用">
+                        <input type="checkbox" class="toggle-enabled" data-id="${p.id}" ${p.isEnabled ? 'checked' : ''}>
+                        <span class="nag-slider"></span>
+                    </label>
+                </div>
+            </div>
+        `;
+        $list.append(html);
+    });
+
+    // 绑定条目内部事件
+    $list.find('.move-up').on('click', function() {
+        const id = $(this).data('id');
+        const idx = settings.presets.findIndex(x => x.id == id);
+        if (idx > -1) {
+            const current = settings.presets[idx];
+            const targetIdx = settings.presets.findIndex(x => x.priority === current.priority - 1);
+            if (targetIdx > -1) {
+                settings.presets[targetIdx].priority++;
+                current.priority--;
+                saveSettings();
+                renderPresets();
+            }
+        }
+    });
+
+    $list.find('.move-down').on('click', function() {
+        const id = $(this).data('id');
+        const idx = settings.presets.findIndex(x => x.id == id);
+        if (idx > -1) {
+            const current = settings.presets[idx];
+            const targetIdx = settings.presets.findIndex(x => x.priority === current.priority + 1);
+            if (targetIdx > -1) {
+                settings.presets[targetIdx].priority--;
+                current.priority++;
+                saveSettings();
+                renderPresets();
+            }
+        }
+    });
+    $list.find('.toggle-hidden').on('click', function() {
+        const id = $(this).data('id');
+        const preset = settings.presets.find(x => x.id == id);
+        if (preset) {
+            preset.isHidden = !preset.isHidden;
+            saveSettings();
+            renderPresets();
+        }
+    });
+
+    $list.find('.toggle-enabled').on('change', function() {
+        const id = $(this).data('id');
+        const preset = settings.presets.find(x => x.id == id);
+        if (preset) {
+            preset.isEnabled = $(this).prop('checked');
+            saveSettings();
+        }
+    });
+
+    $list.find('.edit-item').on('click', function() {
+        const id = $(this).data('id');
+        showPresetModal(id);
+    });
+
+    $list.find('.delete-item').on('click', function() {
+        const id = $(this).data('id');
+        if (confirm('确定要删除这个预设吗？')) {
+            settings.presets = settings.presets.filter(x => x.id != id);
+            saveSettings();
+            renderPresets();
+        }
+    });
+}
+
+function showPresetModal(id = null) {
+    const isEdit = id !== null;
+    const preset = isEdit ? settings.presets.find(x => x.id == id) : {
+        name: '',
+        content: '',
+        icon: '📝',
+        priority: settings.presets.length + 1,
+        isEnabled: true,
+        isHidden: false,
+        role: 'system'
+    };
+
+    if (preset.isLocked) {
+        toastr.warning('该条目不可编辑');
+        return;
+    }
+
+    const modalHtml = `
+        <div class="nag-modal-container" id="nag-preset-modal">
+            <div class="nag-modal">
+                <div class="nag-modal-header">
+                    <span class="nag-modal-title">${isEdit ? '编辑预设' : '添加预设'}</span>
+                    <button class="nag-modal-close">✕</button>
+                </div>
+                <div class="nag-modal-body">
+                    <div class="nag-setting-item">
+                        <label>条目名称</label>
+                        <input type="text" id="modal-preset-name" value="${preset.name}" placeholder="例如：文风控制">
+                    </div>
+                    <div class="nag-setting-item">
+                        <label>内容 (指令)</label>
+                        <textarea id="modal-preset-content" rows="5" placeholder="发送给自定义 AI 的具体指令内容...">${preset.content}</textarea>
+                    </div>
+                    <div class="nag-setting-row">
+                        <div class="nag-setting-item">
+                            <label>图标</label>
+                            <input type="text" id="modal-preset-icon" value="${preset.icon}" placeholder="Emoji">
+                        </div>
+                        <div class="nag-setting-item">
+                            <label>角色 (Role)</label>
+                            <select id="modal-preset-role">
+                                <option value="system" ${preset.role === 'system' ? 'selected' : ''}>System</option>
+                                <option value="user" ${preset.role === 'user' ? 'selected' : ''}>User</option>
+                                <option value="assistant" ${preset.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+                            </select>
+                        </div>
+                        <div class="nag-setting-item">
+                            <label>排序/优先级</label>
+                            <input type="number" id="modal-preset-priority" value="${preset.priority}">
+                        </div>
+                    </div>
+                    <div class="nag-btn-row">
+                        <button id="modal-preset-save" class="menu_button">${isEdit ? '保存' : '创建'}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    $('body').append(modalHtml);
+    const $modal = $('#nag-preset-modal');
+
+    $modal.find('.nag-modal-close').on('click', () => $modal.remove());
+    $modal.find('#modal-preset-save').on('click', () => {
+        const name = $('#modal-preset-name').val().trim();
+        const content = $('#modal-preset-content').val().trim();
+        if (!name || !content) {
+            toastr.warning('名称和内容不能为空');
+            return;
+        }
+
+        const newPreset = {
+            ...preset,
+            name,
+            content,
+            icon: $('#modal-preset-icon').val() || '📝',
+            role: $('#modal-preset-role').val(),
+            priority: parseInt($('#modal-preset-priority').val()) || 0
+        };
+
+        if (isEdit) {
+            const idx = settings.presets.findIndex(x => x.id == id);
+            settings.presets[idx] = newPreset;
+        } else {
+            newPreset.id = Date.now();
+            settings.presets.push(newPreset);
+        }
+
+        saveSettings();
+        renderPresets();
+        $modal.remove();
+    });
+}
+
+/**
+ * 使用 AI 优化提示词
+ * 汇总启用的预设，发送给自定义 API，获取结果
+ */
+async function optimizePromptWithAI() {
+    if (!settings.apiUrl) {
+        toastr.error('请先在 [自定义 API] 模块配置接口');
+        return null;
+    }
+
+    const activePresets = settings.presets
+        .filter(p => p.isEnabled && !p.isHidden)
+        .sort((a, b) => a.priority - b.priority);
+
+    if (activePresets.length === 0) {
+        log('没有启用的预设条目，跳过优化', 'info');
+        return settings.prompt;
+    }
+
+    // 构建消息数组
+    const messages = [
+        { role: 'system', content: settings.presetSystemPrompt }
+    ];
+
+    // 处理预设条目
+    for (const p of activePresets) {
+        if (p.id === 'history') {
+            try {
+                // 获取酒馆历史记录
+                if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+                    const ctx = SillyTavern.getContext();
+                    const chat = ctx.chat || [];
+                    
+                    // 将每一条历史消息都以 system 身份发送，但内容标注原始身份
+                    chat.forEach((msg, idx) => {
+                        const originalRole = msg.is_user ? 'User' : (msg.is_system ? 'System' : 'Assistant');
+                        const name = msg.name || originalRole;
+                        let content = msg.mes || '';
+                        
+                        if (originalRole === 'System') {
+                            content = applyRegexes(content, 'system');
+                        }
+
+                        if (content) {
+                            messages.push({ 
+                                role: 'system', 
+                                content: `[CHAT_HISTORY] #${idx} [${originalRole}] ${name}: ${content}`
+                            });
+                        }
+                    });
+                } else {
+                    log('无法获取 SillyTavern 上下文，跳过历史记录', 'warning');
+                }
+            } catch (err) {
+                log('获取历史记录失败: ' + err.message, 'error');
+            }
+        } else {
+            // 普通预设
+            messages.push({ 
+                role: p.role || 'system', 
+                content: `### ${p.name}\n${p.content}` 
+            });
+        }
+    }
+
+    try {
+        log('正在通过 AI 生成提示词...', 'info');
+        const optimized = await callCustomApi(messages);
+        if (optimized && optimized.trim()) {
+            log('提示词生成成功', 'success');
+            return optimized.trim();
+        }
+        throw new Error('AI 返回内容为空');
+    } catch (e) {
+        log('提示词生成失败: ' + e.message, 'error');
+        toastr.error('提示词生成失败: ' + e.message);
+        return null;
+    }
+}
+
+// ============================================
 // 设置 & UI
 // ============================================
 
@@ -844,6 +1625,29 @@ function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
     settings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
     settings.panelCollapsed = Object.assign({}, defaultSettings.panelCollapsed, settings.panelCollapsed || {});
+    
+    if (!Array.isArray(settings.regexItems)) {
+        settings.regexItems = [];
+    }
+
+    // 确保 history 预设存在
+    if (Array.isArray(settings.presets)) {
+        const hasHistory = settings.presets.some(p => p.id === 'history');
+        if (!hasHistory) {
+            settings.presets.unshift({ 
+                id: 'history', 
+                name: "酒馆聊天历史", 
+                content: "[CHAT_HISTORY]", 
+                isEnabled: false, 
+                isHidden: false, 
+                icon: "📜", 
+                priority: 0, 
+                role: 'system', 
+                isLocked: true 
+            });
+        }
+    }
+
     settings.isRunning = false; 
     settings.isPaused = false;
 }
@@ -941,7 +1745,110 @@ function createUI() {
                     <div class="nag-btn-row"><button id="nag-btn-reset" class="menu_button">🔄 重置</button></div>
                 </div>
 
-                <!-- 📝 生成设置模块 -->
+                <!-- 🌐 自定义 API 模块 -->
+                <div id="nag-panel-api" class="nag-section nag-settings nag-collapsible">
+                    <div class="nag-panel-header" data-panel="api">
+                        <span class="nag-panel-title">🌐 自定义 API</span>
+                        <div class="nag-panel-actions">
+                            <span class="nag-help-btn" data-help="api" title="帮助">❓</span>
+                            <span class="nag-collapse-icon">▼</span>
+                        </div>
+                    </div>
+                    <div class="nag-panel-content">
+                        <div class="nag-checkbox-group">
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="nag-set-api-enabled">
+                                <span>🚀 启用自定义 API (仅限自动生成)</span>
+                            </label>
+                        </div>
+                        <div class="nag-setting-item"><label>API URL</label><input type="text" id="nag-set-api-url" placeholder="https://api.openai.com/v1"></div>
+                        <div class="nag-setting-item"><label>API Key</label><input type="password" id="nag-set-api-key" placeholder="sk-..."></div>
+                        <div class="nag-setting-item">
+                            <label>选择模型</label>
+                            <div class="nag-setting-row">
+                                <select id="nag-set-api-model" style="flex: 1;"><option value="">-- 请先获取列表 --</option></select>
+                                <button id="nag-btn-fetch-models" class="menu_button_icon" title="获取模型列表" style="width: 40px;">🔄</button>
+                            </div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>温度 (Temp)</label><input type="number" id="nag-set-api-temp" min="0" max="2" step="0.1"></div>
+                            <div class="nag-setting-item"><label>Top P</label><input type="number" id="nag-set-api-topp" min="0" max="1" step="0.1"></div>
+                        </div>
+                        <div class="nag-setting-row">
+                            <div class="nag-setting-item"><label>Top K</label><input type="number" id="nag-set-api-topk" min="0" step="1"></div>
+                            <div class="nag-setting-item"><label>最大 Token</label><input type="number" id="nag-set-api-max-tokens" min="1" step="128"></div>
+                        </div>
+                        <div class="nag-setting-item">
+                            <label>额外参数 (JSON)</label>
+                            <textarea id="nag-set-api-extra" rows="2" placeholder='{"frequency_penalty": 0.5}'></textarea>
+                        </div>
+                        <div class="nag-btn-row">
+                            <button id="nag-btn-connect-api" class="menu_button">🔗 连接 API</button>
+                            <button id="nag-btn-test-api" class="menu_button">🧪 测试连接</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 🎭 提示词预设模块 -->
+                <div id="nag-panel-presets" class="nag-section nag-settings nag-collapsible">
+                    <div class="nag-panel-header" data-panel="presets">
+                        <span class="nag-panel-title">🎭 提示词预设</span>
+                        <div class="nag-panel-actions">
+                            <span class="nag-help-btn" data-help="presets" title="帮助">❓</span>
+                            <span class="nag-collapse-icon">▼</span>
+                        </div>
+                    </div>
+                    <div class="nag-panel-content">
+                        <div class="nag-checkbox-group">
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="nag-set-preset-enabled">
+                                <span>🧠 启用预设优化 (发送前由 AI 转换)</span>
+                            </label>
+                        </div>
+                        <div class="nag-setting-item">
+                            <label>系统提示词 (预设处理器)</label>
+                            <textarea id="nag-set-preset-system" rows="3"></textarea>
+                        </div>
+                        <div class="nag-preset-list-header">
+                            <div class="nag-btn-row">
+                                <button id="nag-btn-add-preset" class="menu_button">➕ 添加预设</button>
+                                <button id="nag-btn-optimize-now" class="menu_button">🪄 立即测试优化</button>
+                            </div>
+                        </div>
+                        <div id="nag-preset-list" class="nag-preset-list">
+                            <!-- 预设条目动态加载 -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 🧩 正则替换模块 -->
+                <div id="nag-panel-regex" class="nag-section nag-settings nag-collapsible">
+                    <div class="nag-panel-header" data-panel="regex">
+                        <span class="nag-panel-title">🧩 正则替换</span>
+                        <div class="nag-panel-actions">
+                            <span class="nag-help-btn" data-help="regex" title="帮助">❓</span>
+                            <span class="nag-collapse-icon">▼</span>
+                        </div>
+                    </div>
+                    <div class="nag-panel-content">
+                        <div class="nag-checkbox-group">
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="nag-set-regex-enabled">
+                                <span>✨ 启用正则替换</span>
+                            </label>
+                        </div>
+                        <div class="nag-preset-list-header">
+                            <div class="nag-btn-row">
+                                <button id="nag-btn-add-regex" class="menu_button">➕ 添加正则</button>
+                            </div>
+                        </div>
+                        <div id="nag-regex-list" class="nag-preset-list">
+                            <!-- 正则条目动态加载 -->
+                        </div>
+                    </div>
+                </div>
+
+                <!--  生成设置模块 -->
                 <div id="nag-panel-generate" class="nag-section nag-settings nag-collapsible">
                     <div class="nag-panel-header" data-panel="generate">
                         <span class="nag-panel-title">📝 生成设置</span>
@@ -1172,6 +2079,39 @@ function bindEvents() {
     $('#nag-btn-export-json').on('click', () => exportAsJSON(false));
     $('#nag-btn-refresh-floors').on('click', () => $('#nag-total-floors').text(getTotalFloors()));
     $('#nag-btn-refresh-preview').on('click', refreshPreview);
+
+    // 预设相关事件
+    $('#nag-set-preset-enabled').on('change', function() { settings.enablePresetOptimization = $(this).prop('checked'); saveSettings(); });
+    $('#nag-set-preset-system').on('change', function() { settings.presetSystemPrompt = $(this).val(); saveSettings(); });
+    $('#nag-btn-add-preset').on('click', () => showPresetModal());
+    $('#nag-btn-optimize-now').on('click', async () => {
+        const optimized = await optimizePromptWithAI();
+        if (optimized) {
+            settings.prompt = optimized;
+            $('#nag-set-prompt').val(optimized);
+            saveSettings();
+            toastr.success('提示词已根据预设完成优化');
+        }
+    });
+
+    // 正则替换事件
+    $('#nag-set-regex-enabled').on('change', function() { settings.enableRegexProcessing = $(this).prop('checked'); saveSettings(); });
+    $('#nag-btn-add-regex').on('click', () => showRegexModal());
+    
+    // API 设置事件
+    $('#nag-set-api-url').on('change', function() { settings.apiUrl = $(this).val(); saveSettings(); });
+    $('#nag-set-api-key').on('change', function() { settings.apiKey = $(this).val(); saveSettings(); });
+    $('#nag-set-api-model').on('change', function() { settings.apiModel = $(this).val(); saveSettings(); });
+    $('#nag-set-api-temp').on('change', function() { settings.apiTemp = +$(this).val(); saveSettings(); });
+    $('#nag-set-api-topp').on('change', function() { settings.apiTopP = +$(this).val(); saveSettings(); });
+    $('#nag-set-api-topk').on('change', function() { settings.apiTopK = +$(this).val(); saveSettings(); });
+    $('#nag-set-api-max-tokens').on('change', function() { settings.apiMaxTokens = +$(this).val(); saveSettings(); });
+    $('#nag-set-api-extra').on('change', function() { settings.apiExtraParams = $(this).val(); saveSettings(); });
+    $('#nag-set-api-enabled').on('change', function() { settings.apiEnabled = $(this).prop('checked'); saveSettings(); });
+    $('#nag-btn-fetch-models').on('click', fetchApiModels);
+    $('#nag-btn-connect-api').on('click', fetchApiModels);
+    $('#nag-btn-test-api').on('click', testApiConnection);
+
     // TXT转世界书入口
     $('#nag-btn-txt-to-worldbook').on('click', () => {
         if (typeof window.TxtToWorldbook !== 'undefined') {
@@ -1328,6 +2268,33 @@ function bindEvents() {
 }
 
 function syncUI() {
+    // 预设同步
+    $('#nag-set-preset-enabled').prop('checked', settings.enablePresetOptimization);
+    $('#nag-set-preset-system').val(settings.presetSystemPrompt);
+    renderPresets();
+
+    // 正则同步
+    $('#nag-set-regex-enabled').prop('checked', settings.enableRegexProcessing);
+    renderRegexItems();
+
+    // API 设置
+    $('#nag-set-api-enabled').prop('checked', settings.apiEnabled);
+    $('#nag-set-api-url').val(settings.apiUrl);
+    $('#nag-set-api-key').val(settings.apiKey);
+    $('#nag-set-api-temp').val(settings.apiTemp);
+    $('#nag-set-api-topp').val(settings.apiTopP);
+    $('#nag-set-api-topk').val(settings.apiTopK);
+    $('#nag-set-api-max-tokens').val(settings.apiMaxTokens);
+    $('#nag-set-api-extra').val(settings.apiExtraParams);
+    
+    if (settings.apiUrl && settings.apiKey) {
+        // 如果有设置，尝试填充模型下拉列表（这里只填充当前已保存的模型，或者提示用户刷新）
+        const $select = $('#nag-set-api-model');
+        if (settings.apiModel) {
+            $select.empty().append(`<option value="${settings.apiModel}" selected>${settings.apiModel}</option>`);
+        }
+    }
+
     // 生成设置
     $('#nag-set-total').val(settings.totalChapters);
     $('#nag-set-prompt').val(settings.prompt);
