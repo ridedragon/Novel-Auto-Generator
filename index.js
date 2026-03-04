@@ -1923,6 +1923,9 @@ function updateUI() {
         const avg = elapsed / generationStats.chaptersGenerated;
         $('#nag-time-elapsed').text(formatDuration(elapsed));
         $('#nag-time-remaining').text(formatDuration(avg * (settings.totalChapters - settings.currentChapter)));
+    } else {
+        $('#nag-time-elapsed').text('--:--:--');
+        $('#nag-time-remaining').text('--:--:--');
     }
     $('#nag-stat-errors').text(generationStats.errors.length);
     
