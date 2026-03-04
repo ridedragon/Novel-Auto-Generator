@@ -36,17 +36,12 @@ const defaultSettings = {
     exportIncludeUser: false,
     exportIncludeAI: true,
     useRawContent: true,
-    extractTags: '',
-    extractMode: 'all',
-    tagSeparator: '\n\n',
-    
     panelCollapsed: {
         api: false,
         msgopt: false,
         presets: false,
         generate: false,
         export: false,
-        extract: true,
         advanced: true,
     },
 
@@ -189,38 +184,10 @@ function getLastAIMessageLength() {
 }
 
 // ============================================
-// 标签提取
-// ============================================
-
-function parseTagInput(s) {
-    if (!s || typeof s !== 'string') return [];
-    return s.split(/[,;，；\s\n\r]+/).map(t => t.trim()).filter(t => t.length > 0);
-}
-
-function extractTagContents(text, tags, separator = '\n\n') {
-    if (!text || !tags || tags.length === 0) return '';
-    const parts = [];
-    for (const tag of tags) {
-        const t = tag.trim();
-        if (!t) continue;
-        const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const pattern = new RegExp(`<\\s*${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\s*/\\s*${escaped}\\s*>`, 'gi');
-        let match;
-        while ((match = pattern.exec(text)) !== null) {
-            const content = match[1].trim();
-            if (content) parts.push(content);
-        }
-    }
-    return parts.join(separator);
-}
-
-// ============================================
 // 章节获取
 // ============================================
 
 function getAllChapters() {
-    const tags = parseTagInput(settings.extractTags);
-    const useTags = settings.extractMode === 'tags' && tags.length > 0;
     const chapters = [];
     
     let startFloor = settings.exportAll ? 0 : settings.exportStartFloor;
@@ -234,8 +201,7 @@ function getAllChapters() {
         
         if (rawMessages?.length) {
             for (const msg of rawMessages) {
-                let content = useTags ? extractTagContents(msg.content, tags, settings.tagSeparator) : msg.content;
-                if (!content && useTags) continue;
+                let content = msg.content;
                 if (content?.length > 10) {
                     chapters.push({ floor: msg.floor, index: chapters.length + 1, isUser: msg.isUser, name: msg.name, content });
                 }
@@ -251,7 +217,7 @@ function getAllChapters() {
         if (!isUser && !settings.exportIncludeAI) return;
         const text = msg.querySelector('.mes_text')?.innerText?.trim();
         if (!text) return;
-        let content = useTags ? extractTagContents(text, tags, settings.tagSeparator) : text;
+        let content = text;
         if (content?.length > 10) {
             chapters.push({ floor: idx, index: chapters.length + 1, isUser, content });
         }
@@ -284,28 +250,6 @@ function showHelp(topic) {
     <li><b>✅ 勾选</b>：读取原始内容</li>
     <li><b>❌ 不勾选</b>：读取显示内容（经过正则处理）</li>
 </ul>
-            `
-        },
-        extract: {
-            title: '🏷️ 标签提取说明',
-            content: `
-<h4>📌 什么是标签提取？</h4>
-<p>从 AI 回复的原始内容中，只提取指定 XML 标签内的文字。</p>
-<h4>📌 使用场景</h4>
-<p>当你使用正则美化输出时，原始回复可能包含：</p>
-<pre><思考>AI的思考过程...</思考>
-<content>这是正文内容...</content></pre>
-<p>使用标签提取可以只导出 <content> 内的正文。</p>
-<h4>📌 如何使用</h4>
-<ol>
-    <li>✅ 勾选「原始 (chat.mes)」</li>
-    <li>模式选择「标签」</li>
-    <li>填写要提取的标签名</li>
-</ol>
-<h4>📌 多标签</h4>
-<p>用空格、逗号分隔：<code>content detail 正文</code></p>
-<h4>📌 调试</h4>
-<p>控制台输入 <code>nagDebug()</code></p>
             `
         },
         api: {
@@ -359,9 +303,10 @@ function showHelp(topic) {
 <p>在这里可以添加正则表达式，用于处理特定范围内的文本内容。</p>
 <h4>📌 作用范围</h4>
 <ul>
-    <li><b>历史条目中的所有 system 条目</b>：在发送给自定义 API 进行“预设优化”时，对历史聊天记录中的系统(System)消息进行正则替换。</li>
+    <li><b>历史条目中的所有 system 条目</b>：在发送给自定义 API 进行"预设优化"时，对历史聊天记录中的系统(System)消息进行正则替换。</li>
     <li><b>自定义 AI 输出</b>：对自定义 API 返回的所有结果进行正则替换，包括直接生成的续写内容以及预设优化生成的提示词。</li>
     <li><b>酒馆消息优化</b>：在酒馆AI生成回复后，对回复进行消息优化前执行正则处理。</li>
+    <li><b>导出文本</b>：在导出文本时，对每条正文消息分别应用该正则替换。</li>
 </ul>
 <h4>📌 编写规则</h4>
 <p>可以使用 <code>/pattern/flags</code> 的格式（例如 <code>/\\n+/g</code>），如果直接填写文本则默认使用 <code>g</code> 全局替换。替换内容中的 <code>\\n</code> 和 <code>\\t</code> 会被解析为换行符和制表符。</p>
@@ -492,8 +437,6 @@ function showHelp(topic) {
 
 function refreshPreview() {
     const stChat = getSTChat();
-    const tags = parseTagInput(settings.extractTags);
-    const useTags = settings.extractMode === 'tags' && tags.length > 0;
     
     if (!stChat || stChat.length === 0) {
         $('#nag-preview-content').html(`<div class="nag-preview-warning"><b>⚠️ 无法获取聊天数据</b></div>`);
@@ -521,17 +464,6 @@ function refreshPreview() {
         <div class="nag-preview-raw">${rawPreview}${rawContent.length > 200 ? '...' : ''}</div>
     `;
     
-    if (useTags) {
-        const extracted = extractTagContents(rawContent, tags, settings.tagSeparator);
-        if (extracted) {
-            html += `<div class="nag-preview-success"><b>✅ 提取成功</b> (${extracted.length} 字)<div class="nag-preview-text">${escapeHtml(extracted.slice(0, 400))}</div></div>`;
-        } else {
-            html += `<div class="nag-preview-warning"><b>⚠️ 未找到标签</b> [${tags.join(', ')}]</div>`;
-        }
-    } else {
-        html += `<div class="nag-preview-info"><b>📄 全部内容模式</b></div>`;
-    }
-    
     $('#nag-preview-content').html(html);
 }
 
@@ -552,12 +484,6 @@ function debugRawContent(floorIndex) {
     
     console.log(`\n----- 楼层 ${floorIndex} -----`);
     console.log('mes:', msg.mes?.substring(0, 500));
-    
-    const tags = parseTagInput(settings.extractTags);
-    if (tags.length > 0) {
-        console.log(`\n----- 标签测试 [${tags.join(', ')}] -----`);
-        console.log('结果:', extractTagContents(msg.mes, tags, '\n---\n') || '(无匹配)');
-    }
 }
 
 window.nagDebug = debugRawContent;
@@ -644,6 +570,7 @@ function applyRegexes(text, scope) {
         if (scope === 'system' && r.scopeSystem) applies = true;
         if (scope === 'ai' && r.scopeCustomAI) applies = true;
         if (scope === 'msgOpt' && r.scopeMsgOpt) applies = true;
+        if (scope === 'export' && r.scopeExport) applies = true;
         
         if (applies && r.regex) {
             try {
@@ -680,7 +607,8 @@ function renderRegexItems() {
         let scopeBadges = '';
         if (r.scopeSystem) scopeBadges += '<span class="nag-preset-role-badge role-system" style="margin-right:2px;">System</span>';
         if (r.scopeCustomAI) scopeBadges += '<span class="nag-preset-role-badge role-assistant" style="margin-right:2px;">AI输出</span>';
-        if (r.scopeMsgOpt) scopeBadges += '<span class="nag-preset-role-badge role-user">消息优化</span>';
+        if (r.scopeMsgOpt) scopeBadges += '<span class="nag-preset-role-badge role-user" style="margin-right:2px;">消息优化</span>';
+        if (r.scopeExport) scopeBadges += '<span class="nag-preset-role-badge role-export">导出文本</span>';
 
         const html = `
             <div class="nag-preset-item" data-id="${r.id}">
@@ -772,6 +700,7 @@ function showRegexModal(id = null) {
         scopeSystem: true,
         scopeCustomAI: true,
         scopeMsgOpt: true,
+        scopeExport: false,
         isEnabled: true,
         priority: (settings.regexItems?.length || 0) + 1
     };
@@ -813,6 +742,10 @@ function showRegexModal(id = null) {
                                 <input type="checkbox" id="modal-regex-scope-msgopt" ${rItem.scopeMsgOpt ? 'checked' : ''}>
                                 <span>酒馆消息优化</span>
                             </label>
+                            <label class="nag-checkbox-label">
+                                <input type="checkbox" id="modal-regex-scope-export" ${rItem.scopeExport ? 'checked' : ''}>
+                                <span>导出文本</span>
+                            </label>
                         </div>
                     </div>
                     <div class="nag-btn-row">
@@ -837,13 +770,14 @@ function showRegexModal(id = null) {
         const scopeSystem = $('#modal-regex-scope-system').prop('checked');
         const scopeCustomAI = $('#modal-regex-scope-ai').prop('checked');
         const scopeMsgOpt = $('#modal-regex-scope-msgopt').prop('checked');
+        const scopeExport = $('#modal-regex-scope-export').prop('checked');
 
         if (!name || !regex) {
             toastr.warning('名称和正则内容不能为空');
             return;
         }
 
-        if (!scopeSystem && !scopeCustomAI && !scopeMsgOpt) {
+        if (!scopeSystem && !scopeCustomAI && !scopeMsgOpt && !scopeExport) {
             toastr.warning('至少选择一个作用范围');
             return;
         }
@@ -869,7 +803,8 @@ function showRegexModal(id = null) {
             replacement,
             scopeSystem,
             scopeCustomAI,
-            scopeMsgOpt
+            scopeMsgOpt,
+            scopeExport
         };
 
         if (!settings.regexItems) settings.regexItems = [];
@@ -1542,14 +1477,66 @@ async function exportNovel(silent = false) {
         return; 
     }
     
-    const totalChars = chapters.reduce((s, c) => s + c.content.length, 0);
-    let text = `导出时间: ${new Date().toLocaleString()}\n总章节: ${chapters.length}\n总字数: ${totalChars}\n${'═'.repeat(40)}\n\n`;
+    let text = '';
     chapters.forEach(ch => {
-        text += `══ [${ch.floor}楼] ${ch.isUser ? '用户' : 'AI'} ══\n\n${ch.content}\n\n`;
+        let content = applyRegexes(ch.content, 'export');
+        text += `${content}\n\n`;
     });
     
-    downloadFile(text, `novel_${chapters.length}ch_${Date.now()}.txt`);
-    if (!silent) toastr.success(`已导出 ${chapters.length} 条`);
+    return { text, chapterCount: chapters.length };
+}
+
+function showExportModal(exportType) {
+    const existingModal = document.getElementById('nag-export-modal');
+    if (existingModal) existingModal.remove();
+    
+    const modalHtml = `
+        <div class="nag-modal-container" id="nag-export-modal">
+            <div class="nag-modal">
+                <div class="nag-modal-header">
+                    <span class="nag-modal-title">📤 导出文件</span>
+                    <button class="nag-modal-close">✕</button>
+                </div>
+                <div class="nag-modal-body">
+                    <div class="nag-setting-item">
+                        <label>文件名称</label>
+                        <input type="text" id="modal-export-filename" placeholder="请输入文件名" value="novel_${Date.now()}">
+                    </div>
+                    <div class="nag-btn-row">
+                        <button id="modal-export-confirm" class="menu_button">确认导出</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    $('body').append(modalHtml);
+    const $modal = $('#nag-export-modal');
+    
+    $modal.find('.nag-modal-close').on('click', () => $modal.remove());
+    $modal.find('#modal-export-confirm').on('click', async () => {
+        const filename = $('#modal-export-filename').val().trim();
+        if (!filename) {
+            toastr.warning('请输入文件名');
+            return;
+        }
+        
+        const result = await exportNovel(false);
+        if (result) {
+            if (exportType === 'txt') {
+                downloadFile(result.text, `${filename}.txt`);
+                toastr.success(`已导出 ${result.chapterCount} 条`);
+            } else if (exportType === 'json') {
+                const chapters = getAllChapters();
+                chapters.forEach(ch => {
+                    ch.content = applyRegexes(ch.content, 'export');
+                });
+                downloadFile(JSON.stringify({ time: new Date().toISOString(), chapters }, null, 2), `${filename}.json`, 'application/json');
+                toastr.success('已导出 JSON');
+            }
+        }
+        $modal.remove();
+    });
 }
 
 async function exportAsJSON(silent = false) {
@@ -1558,6 +1545,9 @@ async function exportAsJSON(silent = false) {
         if (!silent) toastr.warning('没有内容'); 
         return; 
     }
+    chapters.forEach(ch => {
+        ch.content = applyRegexes(ch.content, 'export');
+    });
     downloadFile(JSON.stringify({ time: new Date().toISOString(), chapters }, null, 2), `novel_${Date.now()}.json`, 'application/json');
     if (!silent) toastr.success('已导出 JSON');
 }
@@ -2002,10 +1992,6 @@ function updateUI() {
     $('#nag-set-reply-toast-timeout, #nag-set-reply-post-toast-wait').prop('disabled', !settings.enableReplyToastDetection);
 }
 
-function toggleTagSettings() {
-    $('#nag-tags-container, #nag-separator-container').toggle(settings.extractMode === 'tags');
-}
-
 function togglePanel(panelId) {
     const panel = $(`#nag-panel-${panelId}`);
     const isCollapsed = panel.hasClass('collapsed');
@@ -2263,45 +2249,6 @@ function createUI() {
                     </div>
                 </div>
 
-                <!-- 🏷️ 标签提取模块 -->
-                <div id="nag-panel-extract" class="nag-section nag-settings nag-collapsible">
-                    <div class="nag-panel-header" data-panel="extract">
-                        <span class="nag-panel-title">🏷️ 标签提取</span>
-                        <div class="nag-panel-actions">
-                            <span class="nag-help-btn" data-help="extract" title="帮助">❓</span>
-                            <span class="nag-collapse-icon">▼</span>
-                        </div>
-                    </div>
-                    <div class="nag-panel-content">
-                        <div class="nag-setting-item">
-                            <label>提取模式</label>
-                            <select id="nag-set-extract-mode">
-                                <option value="all">全部内容</option>
-                                <option value="tags">只提取指定标签</option>
-                            </select>
-                        </div>
-                        <div class="nag-setting-item" id="nag-tags-container">
-                            <label>标签名称 <span class="nag-hint">(空格/逗号分隔)</span></label>
-                            <textarea id="nag-set-tags" rows="1" placeholder="content detail 正文"></textarea>
-                        </div>
-                        <div class="nag-setting-item" id="nag-separator-container">
-                            <label>分隔符</label>
-                            <select id="nag-set-separator">
-                                <option value="\\n\\n">空行</option>
-                                <option value="\\n">换行</option>
-                                <option value="">无</option>
-                            </select>
-                        </div>
-                        <div class="nag-extract-preview">
-                            <div class="nag-preview-header">
-                                <span>📋 预览</span>
-                                <button id="nag-btn-refresh-preview" class="menu_button_icon">🔄</button>
-                            </div>
-                            <div id="nag-preview-content" class="nag-preview-box"><i>点击刷新</i></div>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- ⚙️ 高级设置模块 -->
                 <div id="nag-panel-advanced" class="nag-section nag-settings nag-collapsible">
                     <div class="nag-panel-header" data-panel="advanced">
@@ -2464,10 +2411,9 @@ function bindEvents() {
     $('#nag-btn-resume').on('click', resumeGeneration);
     $('#nag-btn-stop').on('click', stopGeneration);
     $('#nag-btn-reset').on('click', resetProgress);
-    $('#nag-btn-export-txt').on('click', () => exportNovel(false));
-    $('#nag-btn-export-json').on('click', () => exportAsJSON(false));
+    $('#nag-btn-export-txt').on('click', () => showExportModal('txt'));
+    $('#nag-btn-export-json').on('click', () => showExportModal('json'));
     $('#nag-btn-refresh-floors').on('click', () => $('#nag-total-floors').text(getTotalFloors()));
-    $('#nag-btn-refresh-preview').on('click', refreshPreview);
 
     // 消息优化事件
     $('#nag-set-msgopt-enabled').on('change', function() { settings.enableMsgOptimization = $(this).prop('checked'); saveSettings(); });
@@ -2635,24 +2581,6 @@ function bindEvents() {
     $('#nag-set-use-raw').on('change', function() { 
         settings.useRawContent = $(this).prop('checked'); 
         saveSettings(); 
-        refreshPreview(); 
-    });
-    
-    // 标签提取
-    $('#nag-set-extract-mode').on('change', function() { 
-        settings.extractMode = $(this).val(); 
-        toggleTagSettings(); 
-        saveSettings(); 
-        refreshPreview(); 
-    });
-    $('#nag-set-tags').on('change', function() { 
-        settings.extractTags = $(this).val(); 
-        saveSettings(); 
-        refreshPreview(); 
-    });
-    $('#nag-set-separator').on('change', function() { 
-        settings.tagSeparator = $(this).val().replace(/\\\\n/g, '\n'); 
-        saveSettings(); 
     });
     
     // 发送阶段弹窗检测
@@ -2774,11 +2702,6 @@ function syncUI() {
     $('#nag-set-include-ai').prop('checked', settings.exportIncludeAI);
     $('#nag-set-use-raw').prop('checked', settings.useRawContent);
     
-    // 标签提取
-    $('#nag-set-extract-mode').val(settings.extractMode);
-    $('#nag-set-tags').val(settings.extractTags);
-    $('#nag-set-separator').val(settings.tagSeparator.replace(/\n/g, '\\\\n'));
-    
     // 发送阶段弹窗检测
     $('#nag-set-send-toast-detection').prop('checked', settings.enableSendToastDetection);
     $('#nag-set-send-toast-timeout').val(settings.sendToastWaitTimeout);
@@ -2797,7 +2720,6 @@ function syncUI() {
     $('#nag-set-retries').val(settings.maxRetries);
     $('#nag-set-minlen').val(settings.minChapterLength);
     
-    toggleTagSettings();
     updateUI();
 }
 
