@@ -91,7 +91,7 @@ const defaultSettings = {
 };
 
 let settings = {};
-let abortGeneration = false;
+let abortController = null;
 let generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
 let isOptimizing = false;
 let lastOptimizedId = -1;
@@ -601,7 +601,7 @@ async function waitForToastsClear(timeout, postWaitTime, phase = '') {
     let lastLogTime = 0;
     
     while (hasActiveToast()) {
-        if (abortGeneration) throw new Error('用户中止');
+        await checkStatus();
         
         const elapsed = Date.now() - startTime;
         if (elapsed > timeout) {
@@ -982,6 +982,21 @@ async function testApiConnection() {
     }
 }
 
+/**
+ * 检查暂停和停止状态
+ */
+async function checkStatus() {
+    if (abortController?.signal.aborted) {
+        throw new Error('用户中止');
+    }
+    while (settings.isPaused) {
+        if (abortController?.signal.aborted) {
+            throw new Error('用户中止');
+        }
+        await sleep(500);
+    }
+}
+
 async function callCustomApi(messages, options = {}) {
     // 允许通过 options 覆盖全局模型和参数
     const targetModel = options.model || settings.apiModel;
@@ -1033,23 +1048,54 @@ async function callCustomApi(messages, options = {}) {
         body.top_k = topK;
     }
 
-    const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${key}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-    });
+    const maxRetries = settings.maxRetries || 3;
+    let retries = 0;
 
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`API 错误 (${response.status}): ${err}`);
+    while (retries <= maxRetries) {
+        await checkStatus();
+
+        try {
+            const response = await fetch(`${url.replace(/\/+$/, '')}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${key}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body),
+                signal: abortController?.signal
+            });
+
+            if (!response.ok) {
+                const err = await response.text();
+                throw new Error(`API 错误 (${response.status}): ${err}`);
+            }
+
+            const data = await response.json();
+            let resultContent = data.choices?.[0]?.message?.content || '';
+            
+            if (resultContent && resultContent.trim()) {
+                return applyRegexes(resultContent, 'ai');
+            }
+
+            if (retries >= maxRetries) {
+                throw new Error('API 返回内容为空，已达到最大重试次数');
+            }
+
+            retries++;
+            log(`API 返回为空，第 ${retries} 次重试...`, 'warning');
+            await sleep(1000);
+        } catch (e) {
+            if (e.name === 'AbortError' || e.message === '用户中止') {
+                throw new Error('用户中止');
+            }
+            if (retries >= maxRetries) {
+                throw e;
+            }
+            retries++;
+            log(`API 请求失败，第 ${retries} 次重试: ${e.message}`, 'warning');
+            await sleep(1000);
+        }
     }
-
-    const data = await response.json();
-    let resultContent = data.choices?.[0]?.message?.content || '';
-    return applyRegexes(resultContent, 'ai');
 }
 
 // ============================================
@@ -1087,6 +1133,9 @@ async function sendMessage(text) {
             '[发送阶段] '
         );
     }
+    
+    // 发送后检查一次状态，确保不会在暂停/停止时立即进入 waitForAIResponse
+    await checkStatus();
 }
 
 /**
@@ -1117,7 +1166,7 @@ async function waitForAIResponse(prevCount) {
     const maxWaitForStart = 120000; // 最多等待2分钟让AI开始回复
 
     while (getAIMessageCountRobust() <= prevCount) {
-        if (abortGeneration) throw new Error('用户中止');
+        await checkStatus();
 
         const elapsed = Date.now() - waitStartTime;
         if (elapsed > maxWaitForStart) {
@@ -1146,7 +1195,7 @@ async function waitForAIResponse(prevCount) {
     let stableCount = 0;
     
     while (stableCount < settings.stabilityRequiredCount) {
-        if (abortGeneration) throw new Error('用户中止');
+        await checkStatus();
         
         await sleep(settings.stabilityCheckInterval);
         
@@ -1181,7 +1230,7 @@ async function waitForAIResponse(prevCount) {
     stableCount = 0;
     
     while (stableCount < settings.stabilityRequiredCount) {
-        if (abortGeneration) throw new Error('用户中止');
+        await checkStatus();
         
         await sleep(settings.stabilityCheckInterval);
         
@@ -1210,10 +1259,7 @@ async function generateSingleChapter(num) {
         const generatedPrompt = await optimizePromptWithAI();
         if (generatedPrompt) {
             textToSend = generatedPrompt;
-            // 将生成的内容放入提示词输入框并保存
-            settings.prompt = textToSend;
-            $('#nag-set-prompt').val(textToSend);
-            saveSettings();
+            // 不再覆盖 settings.prompt，仅用于本次发送
         } else {
             throw new Error('自定义 API 生成提示词为空');
         }
@@ -1223,10 +1269,7 @@ async function generateSingleChapter(num) {
         const reply = await callCustomApi(settings.prompt);
         if (reply && reply.trim()) {
             textToSend = reply.trim();
-            // 将生成的内容放入提示词输入框并保存
-            settings.prompt = textToSend;
-            $('#nag-set-prompt').val(textToSend);
-            saveSettings();
+            // 不再覆盖 settings.prompt
         } else {
             throw new Error('自定义 API 返回内容为空');
         }
@@ -1352,6 +1395,7 @@ async function performMessageOptimization(lastAiIndex, rawContent) {
             log('消息优化返回内容为空', 'warning');
         }
     } catch (e) {
+        if (e.message === '用户中止') throw e;
         log('消息优化失败: ' + e.message, 'error');
         toastr.error('消息优化失败: ' + e.message);
     }
@@ -1368,59 +1412,66 @@ async function startGeneration() {
     
     settings.isRunning = true; 
     settings.isPaused = false; 
-    abortGeneration = false;
+    abortController = new AbortController();
     generationStats = { startTime: Date.now(), chaptersGenerated: 0, totalCharacters: 0, errors: [] };
     saveSettings(); 
     updateUI();
     toastr.info(`开始生成 ${settings.totalChapters - settings.currentChapter} 章`);
     
     try {
-        for (let i = settings.currentChapter; i < settings.totalChapters; i++) {
-            if (abortGeneration) {
-                log('检测到停止信号', 'info');
-                break;
-            }
-            
-            while (settings.isPaused && !abortGeneration) {
-                await sleep(500);
-            }
-            
-            if (abortGeneration) break;
+        while (settings.currentChapter < settings.totalChapters) {
+            await checkStatus();
             
             let success = false;
             let retries = 0;
+            const chapterNum = settings.currentChapter + 1;
             
-            while (!success && retries < settings.maxRetries && !abortGeneration) {
+            while (!success && retries < settings.maxRetries) {
                 try {
-                    await generateSingleChapter(i + 1);
+                    await checkStatus();
+                    await generateSingleChapter(chapterNum);
                     success = true;
-                    settings.currentChapter = i + 1;
+                    settings.currentChapter++;
                     saveSettings(); 
                     updateUI();
                 } catch(e) {
-                    if (abortGeneration || e.message === '用户中止') break;
+                    if (e.message === '用户中止') throw e;
                     
                     retries++;
-                    log(`第 ${i+1} 章失败: ${e.message}`, 'error');
-                    generationStats.errors.push({ chapter: i + 1, error: e.message });
+                    log(`第 ${chapterNum} 章失败 (${retries}/${settings.maxRetries}): ${e.message}`, 'error');
+                    generationStats.errors.push({ chapter: chapterNum, error: e.message });
                     
                     if (retries < settings.maxRetries) {
                         log(`等待5秒后重试...`, 'info');
-                        await sleep(5000);
+                        // 重试前的等待也要能被中止
+                        for (let j = 0; j < 10; j++) {
+                            await checkStatus();
+                            await sleep(500);
+                        }
                     }
                 }
             }
             
-            if (abortGeneration) break;
-            if (!success) settings.currentChapter = i + 1;
+            if (!success) {
+                log(`第 ${chapterNum} 章多次尝试后仍然失败，停止生成。`, 'error');
+                toastr.error(`第 ${chapterNum} 章生成失败，请检查设置后重试`);
+                break;
+            }
         }
         
-        if (!abortGeneration) { 
+        if (!abortController.signal.aborted && settings.currentChapter >= settings.totalChapters) { 
             toastr.success('生成完成!'); 
+        }
+    } catch (e) {
+        if (e.message === '用户中止') {
+            log('生成已由用户停止', 'info');
+        } else {
+            log(`生成过程中出现严重错误: ${e.message}`, 'error');
         }
     } finally {
         settings.isRunning = false; 
         settings.isPaused = false;
+        abortController = null;
         saveSettings(); 
         updateUI();
     }
@@ -1439,10 +1490,11 @@ function resumeGeneration() {
 }
 
 function stopGeneration() { 
-    abortGeneration = true; 
-    settings.isRunning = false; 
-    updateUI(); 
-    toastr.warning('已停止'); 
+    if (abortController) {
+        abortController.abort();
+    }
+    // settings.isRunning = false; // 不在这里直接设置，由 startGeneration 的 finally 处理
+    toastr.warning('停止指令已发送'); 
 }
 
 function resetProgress() {
@@ -1452,6 +1504,7 @@ function resetProgress() {
     }
     settings.currentChapter = 0;
     generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
+    lastOptimizedId = -1;
     saveSettings(); 
     updateUI(); 
     toastr.info('已重置');
@@ -1795,6 +1848,7 @@ async function optimizePromptWithAI() {
         }
         throw new Error('AI 返回内容为空');
     } catch (e) {
+        if (e.message === '用户中止') throw e;
         log('提示词生成失败: ' + e.message, 'error');
         toastr.error('提示词生成失败: ' + e.message);
         return null;
